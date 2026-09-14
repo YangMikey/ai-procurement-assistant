@@ -97,6 +97,30 @@ out3, info3 = beautify_bytes(data, "sample.xlsx", "明细", 1, {"in_place": True
 wb3 = load_workbook(io.BytesIO(out3))
 check("就地美化：Sheet 名不变且已套表头样式",
       len(wb3.sheetnames) == 1 and wb3["明细"].cell(row=1, column=1).fill.fgColor.rgb == "FF44546A")
+check("就地美化：数据默认居中", wb3["明细"].cell(row=2, column=1).alignment.horizontal == "center")
 wb3.close()
+
+# ---- 就地美化 + 备份（回归：备份不能被旧内存字节覆盖） ----
+import shutil
+from core.theme import beautify_file_in_place
+TMPF = os.path.join(os.environ["TEMP"], "opencode", "beautify_inplace.xlsx")
+os.makedirs(os.path.dirname(TMPF), exist_ok=True)
+shutil.copyfile(REAL, TMPF)
+bk1, _i1 = beautify_file_in_place(TMPF, "Sheet1", 2, {})
+wb4 = load_workbook(TMPF)
+check("就地美化：备份 sheet 与美化后 sheet 同时存在",
+      bk1.startswith("ai副本") and bk1 in wb4.sheetnames and "Sheet1" in wb4.sheetnames)
+check("就地美化：Sheet1 已美化且数据未变",
+      wb4["Sheet1"].cell(row=2, column=1).fill.fgColor.rgb == "FF44546A"
+      and wb4["Sheet1"].cell(row=4, column=2).value == 300)
+check("就地美化：备份内容=美化前（表头底色≠美化后的深蓝）",
+      str(wb4[bk1].cell(row=2, column=1).fill.fgColor.rgb) != "FF44546A")
+wb4.close()
+bk2, _i2 = beautify_file_in_place(TMPF, "Sheet1", 2, {})
+wb5 = load_workbook(TMPF)
+check("就地美化：二次执行备份递增且旧备份仍在",
+      bk2 != bk1 and bk1 in wb5.sheetnames and bk2 in wb5.sheetnames)
+wb5.close()
+os.remove(TMPF)
 
 print(f"\n===== 表格美化测试通过：{ok} 项断言 =====")

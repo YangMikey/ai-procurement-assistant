@@ -6,6 +6,7 @@
 """
 import datetime as _dt
 import io
+import os
 
 from .registry import skill
 
@@ -83,12 +84,11 @@ def style_sheet(ws, header_row=1, *, autosize=True, freeze=True, autofilter=True
         cell.fill = PatternFill("solid", fgColor=_argb(HEADER_FILL))
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     ws.row_dimensions[hr].height = 24
-    # 数据区：数字右对齐；斑马纹
+    # 数据区：默认**居中**（表头也居中）；斑马纹
     for r in range(hr + 1, nrows + 1):
         for c in range(1, ncols + 1):
             cell = ws.cell(row=r, column=c)
-            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
-                cell.alignment = Alignment(horizontal="right")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
             if banded and (r - hr) % 2 == 0 and cell.fill.patternType is None:
                 cell.fill = PatternFill("solid", fgColor="FFF7F9FC")
     # 数字格式
@@ -188,3 +188,24 @@ def beautify_bytes(data, filename, sheet, header_row=1, options=None):
     info = {"sheet": target.title, "header_row": header_row, "in_place": bool(opt.get("in_place"))}
     wb.close()
     return buf.getvalue(), info
+
+
+def beautify_file_in_place(path, sheet, header_row=1, options=None):
+    """就地美化并写回原文件：**先建 ai副本 备份 → 重读含备份的最新内容 → 美化 → 写回**。
+
+    关键：备份必须先落盘、再重读字节，否则用旧的"内存字节"写回会把刚建的备份覆盖掉（旧 bug）。
+    返回 (backup_sheet_name, info)；文件被占用抛 PermissionError。
+    """
+    from .excel_io import backup_sheet_numbered
+    opt = dict(options or {})
+    opt["in_place"] = True
+    bk = backup_sheet_numbered(path, sheet)          # ① 备份（写盘，已存在则 (1)(2) 递增）
+    with open(path, "rb") as f:                      # ② 重读"含备份"的最新内容
+        fresh = f.read()
+    out, info = beautify_bytes(fresh, os.path.basename(path), sheet, header_row, opt)
+    try:
+        with open(path, "wb") as f:                  # ③ 写回（备份与美化后的 sheet 同在工作簿内）
+            f.write(out)
+    except PermissionError:
+        raise PermissionError(f"文件被占用（可能正在 WPS/Excel 中打开）：{path}")
+    return bk, info

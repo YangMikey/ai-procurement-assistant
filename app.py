@@ -41,7 +41,7 @@ from core.parser_llm import parse_quote_auto
 from core.templater import fill_template
 from core.registry import list_skills
 from core.table_filler import COLORS as FILL_COLORS, export_filled, fill_multi
-from core.theme import beautify_bytes
+from core.theme import beautify_bytes, beautify_file_in_place
 from ui_components import browse_file_path, file_key, pick_columns, pick_header_row
 
 st.set_page_config(page_title="AI 采购助理", page_icon="🧰", layout="wide")
@@ -66,7 +66,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-14.8"
+BUILD = "2026-09-14.9"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -1021,12 +1021,9 @@ elif mode == "表格美化":
             try:
                 with st.spinner("美化中…"):
                     if _inplace and can_writeback(_bsrc):
-                        _bk = backup_sheet_numbered(_bsrc["path"], _bsheet)
-                        _bytes, _info = beautify_bytes(_bsrc["bytes"], _bsrc["name"],
-                                                       _bsheet, _bhdr, _opts)
-                        with open(_bsrc["path"], "wb") as _fh:
-                            _fh.write(_bytes)
-                        st.success(f"已就地美化并写回原文件；备份 Sheet：{_bk}")
+                        _bk, _info = beautify_file_in_place(_bsrc["path"], _bsheet, _bhdr, _opts)
+                        st.success(f"已就地美化并写回原文件；备份 Sheet：**{_bk}**"
+                                   f"（与美化后的 {_bsheet} 同在工作簿内）")
                     else:
                         if _inplace:
                             st.warning("该文件不是 xlsx/xlsm，无法写回 → 已改为下载。")
