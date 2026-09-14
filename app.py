@@ -41,6 +41,7 @@ from core.parser_llm import parse_quote_auto
 from core.templater import fill_template
 from core.registry import list_skills
 from core.table_filler import COLORS as FILL_COLORS, export_filled, fill_multi
+from core.theme import beautify_bytes
 from ui_components import browse_file_path, file_key, pick_columns, pick_header_row
 
 st.set_page_config(page_title="AI 采购助理", page_icon="🧰", layout="wide")
@@ -65,7 +66,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-14.7"
+BUILD = "2026-09-14.8"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -128,7 +129,7 @@ if not st.session_state.get("_boot_logged"):
     log_line(f"app started · build {BUILD} · python {sys.version.split()[0]} · streamlit {st.__version__}")
     st.session_state["_boot_logged"] = True
 
-mode = st.sidebar.radio("任务模式", ["两表匹配补缺", "仅换算", "仅对齐", "完整比价", "多表补全"])
+mode = st.sidebar.radio("任务模式", ["两表匹配补缺", "仅换算", "仅对齐", "完整比价", "多表补全", "表格美化"])
 st.sidebar.caption(f"build {BUILD}")
 st.sidebar.caption("数据本地处理，不上传任何服务器；LLM 功能默认关闭。")
 st.sidebar.caption("写回原文件前自动建「ai副本」备份；文件被 WPS 占用会提示。")
@@ -985,3 +986,57 @@ elif mode == "多表补全":
             except Exception as e:
                 log_exception("多表补全导出失败", e)
                 st.error(f"导出出错（已记日志）：{e}")
+
+elif mode == "表格美化":
+    st.header("🎨 表格美化")
+    st.caption("把任意 xlsx 一键美化：**表头深底白字 / 列宽自适应 / 冻结首行 / 自动筛选 / 数字格式**"
+               "（金额两位小数、百分比、日期）；可选斑马纹、每行最低值高亮。")
+    _bsrc = file_input("bt", "要美化的表格")
+    if _bsrc:
+        try:
+            _bsheets = (get_sheet_names(_bsrc["path"]) if _bsrc["mode"] == "path"
+                        else list_sheets_from_bytes(_bsrc["bytes"], _bsrc["name"]))
+        except Exception:
+            try:
+                _bsheets = list_sheets_from_bytes(_bsrc["bytes"], _bsrc["name"])
+            except Exception as e:
+                st.error(f"读取 Sheet 失败：{e}")
+                st.stop()
+        _bsheet = st.selectbox("Sheet", _bsheets, key=file_key("bt_sheet", _bsrc["name"]))
+        _bhdr = pick_header_row(_bsrc["bytes"], _bsrc["name"], _bsheet,
+                                key=file_key("bt_hdr", _bsrc["name"], _bsheet))
+        _c1, _c2, _c3 = st.columns(3)
+        with _c1:
+            _banded = st.checkbox("斑马纹（隔行浅底）", key="bt_banded")
+        with _c2:
+            _hmin = st.checkbox("每行最低值高亮（可选）", key="bt_hmin",
+                                help="只在可比的数值列之间比（自动跳过序号/日期/时间/数量等）")
+        with _c3:
+            _inplace = st.checkbox("写回原 Sheet（先自动备份）", key="bt_inplace")
+        if _inplace:
+            st.caption("⚠️ 写回会**重写该文件**（openpyxl 可能丢图表/图片/批注等元素）；"
+                       "已自动建 `ai副本<sheet>` 备份；建议先下载确认效果。")
+        if st.button("开始美化", type="primary", key="bt_go"):
+            _opts = {"banded": _banded, "highlight_min": _hmin, "in_place": bool(_inplace)}
+            try:
+                with st.spinner("美化中…"):
+                    if _inplace and can_writeback(_bsrc):
+                        _bk = backup_sheet_numbered(_bsrc["path"], _bsheet)
+                        _bytes, _info = beautify_bytes(_bsrc["bytes"], _bsrc["name"],
+                                                       _bsheet, _bhdr, _opts)
+                        with open(_bsrc["path"], "wb") as _fh:
+                            _fh.write(_bytes)
+                        st.success(f"已就地美化并写回原文件；备份 Sheet：{_bk}")
+                    else:
+                        if _inplace:
+                            st.warning("该文件不是 xlsx/xlsm，无法写回 → 已改为下载。")
+                        _bytes, _info = beautify_bytes(_bsrc["bytes"], _bsrc["name"],
+                                                       _bsheet, _bhdr, _opts)
+                        _fn = f"美化_{os.path.splitext(_bsrc['name'])[0]}.xlsx"
+                        st.download_button("⬇️ 下载美化后的文件", _bytes, file_name=_fn,
+                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                           key="bt_dl")
+                        st.success(f"已生成新 Sheet「{_info['sheet']}」（原表未动，两 sheet 都在文件里）")
+            except Exception as e:
+                log_exception("表格美化失败", e)
+                st.error(f"美化出错（已记日志）：{e}")

@@ -21,13 +21,15 @@ import pandas as pd
 from .aligner import _name_sim, norm_text
 from .registry import skill
 
-# ---------- 颜色档位（浅底深字，不遮数据、互不冲突） ----------
+# ---------- 颜色档位（统一取主题语义色：高=浅黄 / 中=浅蓝 / 低=浅紫 / 缺失=浅灰） ----------
+from .theme import COLORS as _THEME_COLORS
+
 COLORS = {
-    "ok":   {"fill": None,      "font": None},        # 100%
-    "high": {"fill": "#FFF2CC", "font": "#7F6000"},   # 80~99%
-    "mid":  {"fill": "#F2F2F2", "font": "#595959"},   # 40~80%
-    "low":  {"fill": "#DDEBF7", "font": "#1F4E79"},   # 20~40%
-    "miss": {"fill": "#FCE8E6", "font": None},        # <20% / 无候选（留空）
+    "ok":   {"fill": None,                       "font": None},                      # 100%
+    "high": {"fill": _THEME_COLORS["conf_high"][0], "font": _THEME_COLORS["conf_high"][1]},  # 80~99%
+    "mid":  {"fill": _THEME_COLORS["conf_mid"][0],  "font": _THEME_COLORS["conf_mid"][1]},   # 40~80%
+    "low":  {"fill": _THEME_COLORS["conf_low"][0],  "font": _THEME_COLORS["conf_low"][1]},   # 20~40%
+    "miss": {"fill": _THEME_COLORS["missing"][0],   "font": None},                     # <20%/无候选
 }
 KEY_MIN = 20.0          # 低于此分视为"未匹配"（留空+红）
 COL_DEFAULT_THRESHOLD = 70.0
@@ -239,10 +241,11 @@ def legend_lines(stats):
 
 
 def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None):
-    """写出带颜色的整合表 + 下方备注块。返回 out_path。"""
+    """写出带颜色的整合表 + 下方备注块（表头/列宽/冻结/筛选/数字格式由 theme 统一处理）。"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
+
+    from .theme import style_sheet as _style
 
     wb = Workbook()
     ws = wb.active
@@ -262,16 +265,10 @@ def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None):
             cell.fill = PatternFill("solid", fgColor="FF" + spec["fill"].lstrip("#"))
             if spec["font"]:
                 cell.font = Font(color="FF" + spec["font"].lstrip("#"))
-    for c in range(1, len(cols) + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 18
 
-    if stats is not None:
-        tail = legend_lines(stats)
-        if extra_notes:
-            tail += list(extra_notes)
-        ws.append([])
-        for line in tail:
-            ws.append([line])
-            ws.cell(row=ws.max_row, column=1).alignment = Alignment(horizontal="left")
+    notes = list(legend_lines(stats)) if stats is not None else []
+    if extra_notes:
+        notes += list(extra_notes)
+    _style(ws, 1, highlight_min=False, footer_lines=notes or None)
     wb.save(out_path)
     return out_path

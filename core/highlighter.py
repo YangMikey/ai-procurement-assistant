@@ -6,8 +6,9 @@ from openpyxl.utils import get_column_letter
 from .converter import to_number
 from .registry import skill
 
-# 浅色彩虹预设（名称, 底色, 字色）——默认「浅黄」（WPS 习惯）
+# 浅色彩虹预设（名称, 底色, 字色）——默认「结论绿」（语义色：最低价=结论）
 PRESETS = [
+    ("结论绿", "#E2EFDA", "#375623"),
     ("浅黄", "#FFEB9C", "#9C6500"),
     ("浅红", "#FFC7CE", "#9C0006"),
     ("浅橙", "#FFD9B3", "#9C5700"),
@@ -17,7 +18,7 @@ PRESETS = [
     ("浅紫", "#E4DFEC", "#5B2C6F"),
     ("浅粉", "#FCE4EC", "#9C1E5A"),
 ]
-DEFAULT_FILL, DEFAULT_FONT = "#FFEB9C", "#9C6500"
+DEFAULT_FILL, DEFAULT_FONT = "#E2EFDA", "#375623"
 
 
 def _argb(hex_color, default="FFFFFFFF"):
@@ -60,11 +61,14 @@ def find_min(df, supplier_cols):
 def export_highlighted(matrix_df, supplier_cols, out_path,
                        min_col="最低价", sup_col="最低价供应商",
                        min_fill=DEFAULT_FILL, min_font=DEFAULT_FONT):
-    """把比价矩阵写为 xlsx：每行最低价单元格标红，附最低价供应商两列。
+    """把比价矩阵写为 xlsx：每行最低价单元格标色（默认"结论绿"），附最低价供应商两列。
 
-    min_fill / min_font：#RRGGBB 或 ARGB；配色见 PRESETS（默认浅黄）。
+    min_fill / min_font：#RRGGBB 或 ARGB；配色见 PRESETS（默认结论绿）。
+    统一美化（表头/列宽自适应/冻结/AutoFilter/数字格式）由 core.theme 提供。
     """
     from openpyxl import Workbook
+
+    from .theme import footer_lines as _footer, style_sheet as _style
 
     min_vals, min_sups = find_min(matrix_df, supplier_cols)
     fill, font = _fill_font(min_fill, min_font)
@@ -93,9 +97,8 @@ def export_highlighted(matrix_df, supplier_cols, out_path,
                     cell.fill = fill
                     cell.font = font
                     cell.alignment = Alignment(horizontal="center")
-    for c_idx in range(1, len(cols) + 1):
-        ws.column_dimensions[get_column_letter(c_idx)].width = 18
-    ws.freeze_panes = "A2"
+    _style(ws, 1, highlight_min=False,
+           footer_lines=_footer("比价矩阵", "", ["（色块=该行最低价）"]))
     wb.save(out_path)
     return out_path
 

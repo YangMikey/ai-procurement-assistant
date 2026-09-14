@@ -97,8 +97,8 @@ i_end = list(r.columns).index("合同结束时间") + 1
 c_ok = ws.cell(row=2, column=i_end)          # A 公司：完全匹配 → 不标色
 c_miss = ws.cell(row=5, column=i_end)        # ZZZ集团：未匹配 → 浅红底
 check("导出：完全匹配不填色", c_ok.fill.fgColor.rgb in (None, "00000000"))
-check("导出：未匹配单元格浅红底（FFC7CE/FCE8E6 档）",
-      str(c_miss.fill.fgColor.rgb).upper().endswith("FCE8E6"))
+check("导出：未匹配单元格=主题「缺失」浅灰（FFF2F2F2）",
+      str(c_miss.fill.fgColor.rgb).upper().endswith("F2F2F2"))
 tail_txt = "".join(str(ws.cell(row=rr, column=1).value or "") for rr in range(ws.max_row - 6, ws.max_row + 1))
 check("导出：表格下方写了图例/统计备注", "颜色图例" in tail_txt and "统计" in tail_txt)
 wb.close()

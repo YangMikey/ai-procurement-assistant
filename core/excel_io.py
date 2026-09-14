@@ -217,8 +217,8 @@ def export_fallback_result(df, folder, name=None):
 
 def _export_single_sheet(df, out_path, sheet_name=RESULT_SHEET_BASE):
     from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
+
+    from .theme import footer_lines as _footer, style_sheet as _style
 
     wb = Workbook()
     ws = wb.active
@@ -231,16 +231,11 @@ def _export_single_sheet(df, out_path, sheet_name=RESULT_SHEET_BASE):
             if cell.data_type == "f":
                 cell.data_type = "s"
     if RATE_COL in df.columns:
+        from openpyxl.utils import get_column_letter
         letter = get_column_letter(list(df.columns).index(RATE_COL) + 1)
         for r in range(2, ws.max_row + 1):
             ws[f"{letter}{r}"].number_format = '0.0"%"'
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="D9E1F2")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = _estimate_width(df[col_name])
-    ws.freeze_panes = "A2"
+    _style(ws, 1, footer_lines=_footer(sheet_name, ""))
     wb.save(out_path)
 
 
@@ -288,11 +283,11 @@ def list_sheets_from_bytes(data, filename):
     return names
 
 
-def export_df_bytes(df, sheet_name="结果"):
-    """DataFrame → xlsx 字节流（供网页下载），带表头样式与冻结首行。"""
+def export_df_bytes(df, sheet_name="结果", source="", footer_extra=None):
+    """DataFrame → xlsx 字节流（供网页下载）：统一美化（表头/列宽自适应/冻结/筛选/数字格式/页脚）。"""
     from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
+
+    from .theme import footer_lines as _footer, style_sheet as _style
 
     wb = Workbook()
     ws = wb.active
@@ -304,13 +299,7 @@ def export_df_bytes(df, sheet_name="结果"):
         for cell in cells:
             if cell.data_type == "f":
                 cell.data_type = "s"
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="D9E1F2")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    for col_idx in range(1, len(df.columns) + 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 18
-    ws.freeze_panes = "A2"
+    _style(ws, 1, footer_lines=_footer(source or sheet_name, "", footer_extra))
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
