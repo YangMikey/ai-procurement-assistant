@@ -106,4 +106,70 @@ os.remove(TMP)
 
 check("调色板：五档齐备（ok/high/mid/low/miss）",
       set(COLORS.keys()) == {"ok", "high", "mid", "low", "miss"})
+# ---- 多钥匙（自动识别）+ 分层降级 + 级联 ----
+tpl8 = pd.DataFrame({"供应商": ["甲", "甲"], "品类": ["A", "B"], "价格": ["", ""]})
+sA = pd.DataFrame({"供应商": ["甲", "甲"], "品类": ["A", "B"], "价格": [10, 20]})
+r8 = fill_multi(tpl8, key_cols=["供应商", "品类"], sources=[{"name": "sA", "df": sA}])
+check("多钥匙：两列钥匙区分同供应商不同品类（10/20）",
+      list(r8["result"]["价格"]) == [10, 20])
+
+tpl9 = pd.DataFrame({"项目": ["P1"], "类别": ["X"], "负责人": [""]})
+sB = pd.DataFrame({"项目": ["P1"], "类别": ["Y"], "负责人": ["张三"]})   # 类别对不上 → 2 钥匙失配
+r9 = fill_multi(tpl9, key_cols=["项目", "类别"], sources=[{"name": "sB", "df": sB}])
+check("分层降级：两钥匙失配→降为单钥匙命中", r9["result"]["负责人"].iloc[0] == "张三")
+
+tplC = pd.DataFrame({"项目名称": ["P1"], "合同编号": [""], "事业部": [""]})
+c1s = pd.DataFrame({"项目名称": ["P1"], "合同编号": ["C1"]})
+c2s = pd.DataFrame({"合同编号": ["C1"], "事业部": ["事业部A"]})
+rC = fill_multi(tplC, key_cols=["项目名称"], sources=[{"name": "源1", "df": c1s}, {"name": "源2", "df": c2s}])
+check("级联：第1轮补出合同编号", rC["result"]["合同编号"].iloc[0] == "C1")
+check("级联：第2轮用合同编号补出事业部", rC["result"]["事业部"].iloc[0] == "事业部A")
+check("级联：统计含轮数与间接格数",
+      rC["stats"]["级联轮数"] >= 2 and rC["stats"]["间接补全格数"] >= 1)
+
+# 低置信不升级为钥匙（模糊 70 分补出的合同编号 不应成为钥匙）
+tplD = pd.DataFrame({"项目名称": ["朗晴居二期"], "合同编号": [""], "事业部": [""]})
+d1 = pd.DataFrame({"项目名称": ["朗晴花园"], "合同编号": ["C9"]})   # 与"朗晴居二期"约 50 分（<80）
+d2 = pd.DataFrame({"合同编号": ["C9"], "事业部": ["事业部B"]})
+rD = fill_multi(tplD, key_cols=["项目名称"], sources=[{"name": "源1", "df": d1}, {"name": "源2", "df": d2}])
+check("低置信：模糊补出的值不升级为钥匙（事业部未补）",
+      str(rD["result"]["事业部"].iloc[0]).strip() == ""
+      and str(rD["confidence"].loc[0, "事业部"]).startswith("miss"))
+
+# 三跳链 + 轮数上限
+tplE = pd.DataFrame({"A": ["a1"], "B": [""], "C": [""], "D": [""]})
+e1 = pd.DataFrame({"A": ["a1"], "B": ["b1"]})
+e2 = pd.DataFrame({"B": ["b1"], "C": ["c1"]})
+e3 = pd.DataFrame({"C": ["c1"], "D": ["d1"]})
+rE = fill_multi(tplE, key_cols=["A"], sources=[{"name": "e1", "df": e1}, {"name": "e2", "df": e2},
+                                              {"name": "e3", "df": e3}], max_rounds=4)
+check("三跳链：B/C/D 全部补出，轮数=3", list(rE["result"][["B", "C", "D"]].iloc[0]) == ["b1", "c1", "d1"]
+      and rE["stats"]["级联轮数"] == 3)
+
+# 歧义：同钥匙多行且取值不同 → 取值第1条 + 低置信 + 备注
+tplF = pd.DataFrame({"钥匙": ["k1"], "值": [""]})
+f1 = pd.DataFrame({"钥匙": ["k1", "k1"], "值": ["X", "Y"]})
+rF = fill_multi(tplF, key_cols=["钥匙"], sources=[{"name": "f1", "df": f1}])
+check("歧义：取第1条并降档+备注",
+      rF["result"]["值"].iloc[0] == "X" and str(rF["confidence"].loc[0, "值"]).startswith("low")
+      and "歧义" in str(rF["confidence"].loc[0, "值"]) and rF["stats"]["歧义格数"] == 1)
+
+# ---- 真实文件：采购项目汇总（用「事业部匹配结果」补 Sheet1 的合同编号，双钥匙） ----
+KF = os.path.join(_ROOT, "data", "ground_truth", "钥匙表_采购项目汇总.xlsx")
+if os.path.exists(KF):
+    from core.excel_io import read_table
+    src_df = read_table(KF, "事业部匹配结果", header_row=1)
+    tplK = src_df[["项目名称", "采购三级分类"]].copy()
+    tplK["合同编号"] = ""
+    rK = fill_multi(tplK, key_cols=["项目名称", "采购三级分类"],
+                    sources=[{"name": "GT", "df": src_df}])
+    hit = (rK["result"]["合同编号"].astype(str).str.strip() != "").mean()
+    row0 = rK["result"][(rK["result"]["项目名称"] == "朗晴居二期")
+                        & (rK["result"]["采购三级分类"] == "绿化养护")]
+    check("真实文件：双钥匙补全命中率 ≥ 90%", hit >= 0.9)
+    check("真实文件：指定行合同编号正确（朗晴居二期/绿化养护）",
+          len(row0) == 1 and str(row0["合同编号"].iloc[0]).startswith("YC-XMYC0112-WF02"))
+else:
+    check("真实文件：钥匙表_采购项目汇总.xlsx 存在", False)
+
 print(f"\n===== 多表补全测试通过：{ok} 项断言（离线）=====")

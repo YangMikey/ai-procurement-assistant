@@ -66,7 +66,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-14.10"
+BUILD = "2026-09-14.11"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -895,15 +895,16 @@ elif mode == "多表补全":
 
     st.subheader("① 模板表")
     _tpl_src = file_input("tpl", "模板表")
-    _tpl_df, _tk = None, None
+    _tpl_df, _tkeys = None, []
     if _tpl_src:
         _tpl_df, _tpl_sheet, _tpl_hdr = load_table(_tpl_src, file_key("tpl", _tpl_src["name"], _tpl_src["path"]))
         if _tpl_df is not None and len(_tpl_df.columns):
-            _tk = pick_columns(_tpl_df, "🔑 模板·钥匙列（一般第 1 列）", mode="single",
-                               key=file_key("tplkey", _tpl_src["name"], _tpl_sheet, _tpl_hdr))
-            _tk = _tk[0] if _tk else _tpl_df.columns[0]
-            st.caption(f"模板：{len(_tpl_df)} 行 × {len(_tpl_df.columns)} 列；钥匙列 = **{_tk}**；"
-                       f"待补列：{'、'.join(c for c in _tpl_df.columns if c != _tk)}")
+            _picked = pick_columns(_tpl_df, "🔑 模板·钥匙列（可多选，最多 5 个；点击顺序=优先级）",
+                                   key=file_key("tplkey", _tpl_src["name"], _tpl_sheet, _tpl_hdr))
+            _tkeys = [c for c in _picked if c in _tpl_df.columns][:5] or [list(_tpl_df.columns)[0]]
+            st.caption(f"模板：{len(_tpl_df)} 行 × {len(_tpl_df.columns)} 列；"
+                       f"钥匙列（{len(_tkeys)} 个，按优先级）= **{'、'.join(str(c) for c in _tkeys)}**；"
+                       f"待补列：{'、'.join(str(c) for c in _tpl_df.columns if c not in _tkeys)}")
 
     st.subheader("② 源表（可多张）")
     _src_kind = st.radio("源表来源", ["上传文件（可多选）", "从项目 raw_quotes 目录选"],
@@ -927,20 +928,37 @@ elif mode == "多表补全":
             _df2, _sh2, _hdr2 = load_table(_s, file_key("mf", _nm, _i))
             if _df2 is None or not len(_df2.columns):
                 continue
-            _kc = pick_columns(_df2, "🔑 该源表·钥匙列", mode="single",
-                               key=file_key("mfkey", _nm, _sh2, _hdr2, _i))
-            _kc = _kc[0] if _kc else _df2.columns[0]
-            st.caption(f"钥匙列 = **{_kc}**｜可用列：{'、'.join(str(c) for c in _df2.columns if c != _kc)}")
-            _sources.append({"name": _nm, "df": _df2, "key_col": _kc})
+            st.caption(f"可用列：{'、'.join(str(c) for c in _df2.columns)}")
+            _sources.append({"name": _nm, "df": _df2})
 
-    if _tpl_df is not None and _tk and _sources:
+    if _tpl_df is not None and _tkeys and _sources:
         st.subheader("③ 列供给（自动发现，可改）")
-        _thr2 = st.slider("列名匹配阈值（默认 70；越低越容易对上）", 50, 100, 70, key="mf_thr")
-        _kmin2 = st.slider("钥匙最低相似度（低于此视为未匹配→留空）", 0, 60, 20, key="mf_kmin")
+        _c1, _c2, _c3, _c4 = st.columns(4)
+        with _c1:
+            _thr2 = st.slider("列名匹配阈值", 50, 100, 70, key="mf_thr",
+                              help="越低越容易把两列认成同一列")
+        with _c2:
+            _kmin2 = st.slider("钥匙最低相似度", 0, 60, 20, key="mf_kmin")
+        with _c3:
+            _rnd2 = st.slider("最大级联轮数", 1, 6, 4, key="mf_rounds",
+                              help="某轮没有新补出就提前停")
+        with _c4:
+            _pmin2 = st.slider("升级为钥匙门槛", 50, 100, 80, key="mf_promote",
+                               help="补出的值置信 ≥ 此分才允许当钥匙去补别的列")
+        try:
+            from core.table_filler import preview_keys as _pk
+            _kp = _pk(_tkeys, _sources, float(_thr2))
+            _hint = "；".join(f"{nm}: " + ("、".join(f"{tk}←{sc}" for tk, sc, _ in pr) or "未识别到")
+                              for nm, pr in _kp)
+            st.caption(f"🔑 源表钥匙自动识别（按模板钥匙列）：{_hint}")
+        except Exception:
+            pass
+
         from core.table_filler import discover_supply as _disc
-        _sup = _disc([c for c in _tpl_df.columns if c != _tk], _sources, float(_thr2))
+        _tcols2 = [c for c in _tpl_df.columns if c not in _tkeys]
+        _sup = _disc(_tcols2, _sources, float(_thr2))
         _mapping2 = {}
-        for _tcol in [c for c in _tpl_df.columns if c != _tk]:
+        for _tcol in _tcols2:
             _cands = _sup.get(_tcol) or []
             _opts = ["不补"] + [f"{_c['name']}【{_c['col']}】({_c['how']},{_c['score']:.0f})"
                                 for _c in _cands]
@@ -952,14 +970,16 @@ elif mode == "多表补全":
                 _c2 = _cands[_idx2]
                 _mapping2[_tcol] = (_c2["source"], _c2["col"])
         st.caption("颜色图例：" + "；".join([
-            "无色=完全匹配(100%)", "浅黄=高置信(80–99%)", "浅灰=中置信(40–80%)",
-            "浅蓝=低置信(20–40%)", "浅红底空格=未匹配"]))
+            "无色=完全匹配(100%)", "浅黄=高置信(80–99%)", "浅蓝=中置信(40–80%)",
+            "浅紫=低置信(20–40%)", "浅灰底空格=未匹配"]))
 
         if st.button("生成补全表", type="primary", key="mf_go"):
             try:
-                with st.spinner("填充中…"):
-                    _res2 = fill_multi(_tpl_df, _tk, _sources, mapping=_mapping2,
-                                       col_threshold=float(_thr2), key_min=float(_kmin2))
+                with st.spinner("填充中…（含自动级联）"):
+                    _res2 = fill_multi(_tpl_df, key_cols=_tkeys, sources=_sources,
+                                       mapping=_mapping2, col_threshold=float(_thr2),
+                                       key_min=float(_kmin2), max_rounds=int(_rnd2),
+                                       promote_min=float(_pmin2))
                 st.session_state["mf_res"] = _res2
             except Exception as e:
                 log_exception("多表补全失败", e)
@@ -971,7 +991,9 @@ elif mode == "多表补全":
             _st2 = _mfres["stats"]
             st.caption(f"完全匹配 {_st2['完全匹配(100%)']}｜高置信 {_st2['高置信(80-99%)']}｜"
                        f"中置信 {_st2['中置信(40-80%)']}｜低置信 {_st2['低置信(20-40%)']}｜"
-                       f"未匹配(留空) {_st2['未匹配(留空)']}｜有未补全格的行：{_st2['未补全行数']}")
+                       f"未匹配(留空) {_st2['未匹配(留空)']}｜有未补全格的行：{_st2['未补全行数']}｜"
+                       f"级联轮数 {_st2.get('级联轮数', 1)}｜间接补全 {_st2.get('间接补全格数', 0)}｜"
+                       f"歧义格 {_st2.get('歧义格数', 0)}")
             st.dataframe(_mfres["result"], height=420, width="stretch")
             try:
                 os.makedirs(_OUT_DIR2, exist_ok=True)
