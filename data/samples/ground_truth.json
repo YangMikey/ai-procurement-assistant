@@ -1,0 +1,86 @@
+{
+  "tax": 0.13,
+  "items": [
+    {
+      "canonical": "螺钉 M4×10",
+      "spec": "M4×10",
+      "qty": 100,
+      "prices_tax_in": {
+        "A": 12.5,
+        "B": 11.88,
+        "C": 12.88,
+        "D": 12.25
+      },
+      "alias_D": "螺钉M4*10",
+      "missing_in": []
+    },
+    {
+      "canonical": "电线电缆 3×2.5mm²",
+      "spec": "BV-3×2.5",
+      "qty": 20,
+      "prices_tax_in": {
+        "A": 386.0,
+        "B": 366.7,
+        "C": 397.58,
+        "D": 378.28
+      },
+      "alias_D": "电线电缆BV3x2.5",
+      "missing_in": []
+    },
+    {
+      "canonical": "86型触摸开关",
+      "spec": "86型",
+      "qty": 50,
+      "prices_tax_in": {
+        "A": 22.8,
+        "B": 21.66,
+        "C": 23.48,
+        "D": 22.34
+      },
+      "alias_D": "触摸开关86型",
+      "missing_in": []
+    },
+    {
+      "canonical": "PVC线管 20mm",
+      "spec": "Φ20",
+      "qty": 300,
+      "prices_tax_in": {
+        "A": 3.2,
+        "B": 3.04,
+        "C": 3.3,
+        "D": 3.14
+      },
+      "alias_D": null,
+      "missing_in": []
+    },
+    {
+      "canonical": "LED灯管 T8 1.2m",
+      "spec": "T8/1.2m",
+      "qty": 80,
+      "prices_tax_in": {
+        "A": 9.9,
+        "B": 9.4,
+        "C": 10.2,
+        "D": 9.7
+      },
+      "alias_D": null,
+      "missing_in": [
+        "D"
+      ]
+    },
+    {
+      "canonical": "水泥钉 2寸",
+      "spec": "2寸",
+      "qty": 40,
+      "prices_tax_in": {
+        "A": 15.6,
+        "B": 14.82,
+        "C": 16.07,
+        "D": 15.29
+      },
+      "alias_D": null,
+      "missing_in": []
+    }
+  ],
+  "extra_only_in_D": "劳保手套"
+}

@@ -1,0 +1,8 @@
+{
+  "provider": "opencode-go",
+  "model": "deepseek-v4.1-flash",
+  "enabled": true,
+  "base_url": null,
+  "max_tokens": 4000,
+  "note": "LLM 开启（opencode Go · DeepSeek V4.1 Flash）。推理型模型需给足 max_tokens，否则正文可能为空。可在侧栏改配置/自检/清缓存。"
+}
