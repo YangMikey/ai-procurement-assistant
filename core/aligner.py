@@ -130,8 +130,12 @@ def record_alias(experience, item_row, canonical_key, key_fields=_DEFAULT_KEY_FI
     task_modes=["完整比价"],
 )
 def align_quotes(quotes, price_field="不含税单价", key_fields=_DEFAULT_KEY_FIELDS,
-                 threshold=80.0, experience=None, tax_rate=0.13):
-    """把多份 ParsedQuote 对齐成比价矩阵。"""
+                 threshold=60.0, experience=None, tax_rate=0.13):
+    """把多份 ParsedQuote 对齐成比价矩阵。
+
+    threshold 默认 60（**尽量填充**）：非"规范化后完全相同"的命中都会写进「对齐备注」
+    （含方式与相似度百分比），供人工复查；精确命中的不备注。
+    """
     key_fields = tuple(key_fields)
     suppliers = [q["supplier"] for q in quotes]
     lut = {}
@@ -152,9 +156,9 @@ def align_quotes(quotes, price_field="不含税单价", key_fields=_DEFAULT_KEY_
 
     def _way(level, score, scorer):
         if level == "精确":
-            return "精确"
+            return "精确"                      # 去格式后完全相同 → 无需备注
         if level == "模糊":
-            return f"模糊({scorer} {score:.0f})"
+            return f"模糊 {score:.0f}%"         # 备注写清"怎么填的 + 相似度"
         if level == "经验库":
             return "经验库兜底"
         return "新品类"
@@ -177,17 +181,24 @@ def align_quotes(quotes, price_field="不含税单价", key_fields=_DEFAULT_KEY_
             # ① 规范化精确（最优先）
             if key in canon_by_key:
                 cidx, level = canon_by_key[key], "精确"
-            # ② 模糊（规格作一致性下限）
+            # ② 模糊（尽量填充：规格不一致不直接否掉，但降级并备注）
             if cidx is None and canon:
-                best, bs, bscorer = None, 0.0, "ratio"
+                best, bs, bscorer, bspec = None, 0.0, "ratio", None
+                _sp = str(row.get("规格", "") or "").strip()
                 for ci, c in enumerate(canon):
                     s, sc = _name_sim(norm_text(name), norm_text(c["品名"]))
-                    if str(row.get("规格", "") or "").strip() and c["规格"].strip():
-                        ss, _ = _name_sim(norm_text(row.get("规格", "")), norm_text(c["规格"]))
-                        if ss < s:
-                            s, sc = ss, "spec"
+                    if _sp and c["规格"].strip():
+                        ss, _ = _name_sim(norm_text(_sp), norm_text(c["规格"]))
+                        bspec_tmp = ss
+                        if ss >= threshold:
+                            if ss < s:
+                                s, sc = ss, "spec"
+                        else:
+                            sc = "spec-low"        # 规格对不上：仍需品名达标
+                    else:
+                        bspec_tmp = None
                     if s > bs:
-                        bs, best, bscorer = s, ci, sc
+                        bs, best, bscorer, bspec = s, ci, sc, bspec_tmp
                 if best is not None and bs >= threshold:
                     cidx, level, score, scorer = best, "模糊", bs, bscorer
             # ③ 经验库兜底（规则都没结果时才用）
@@ -211,6 +222,9 @@ def align_quotes(quotes, price_field="不含税单价", key_fields=_DEFAULT_KEY_
                 if c["数量"] in ("", None):
                     c["数量"] = row.get("数量", "")
             conf, cnote = _conf_level(level, score, scorer, row, canon[cidx])
+            if scorer == "spec-low":
+                conf = "低"
+                cnote = (cnote + "；" if cnote else "") + f"规格不一致({(bspec or 0):.0f}%)"
             key_to_canon[key] = canon[cidx]["key"]
             way = _way(level, score, scorer)
             if level in ("模糊", "经验库"):

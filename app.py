@@ -64,7 +64,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-14.5"
+BUILD = "2026-09-14.6"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -733,7 +733,9 @@ elif mode in ("仅对齐", "完整比价"):
             _pf = st.radio("比价口径", ["不含税单价", "含税单价"], index=0,
                            horizontal=True, key="cmp_pf")
         with _c3:
-            _thr = st.slider("模糊阈值", 50, 100, 80, key="cmp_thr")
+            _thr = st.slider("模糊阈值（越低越'尽量填充'）", 30, 100, 60, key="cmp_thr",
+                             help="去格式后完全相同→精确命中（不备注）；其余命中都会在"
+                                  "「对齐备注」写清方式+相似度，供你复查")
         if st.button("对齐生成矩阵", type="primary", disabled=not _keyf, key="cmp_align"):
             try:
                 with st.spinner("对齐中…"):
