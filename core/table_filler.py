@@ -353,6 +353,13 @@ def preview_keys(template_keys, sources, col_threshold=COL_DEFAULT_THRESHOLD):
             for s in sources]
 
 
+def supply_option_label(cand, sources):
+    """「列供给」下拉标签：源表名【源列】(匹配方式,分数)。（候选字典无 name 字段，需查 sources）"""
+    si = cand.get("source", 0)
+    sname = sources[si]["name"] if isinstance(si, int) and 0 <= si < len(sources) else "?"
+    return f"{sname}【{cand.get('col', '')}】({cand.get('how', '')},{cand.get('score', 0):.0f})"
+
+
 def discover_supply(tpl_cols, sources, col_threshold=COL_DEFAULT_THRESHOLD, mapping=None):
     """发现每个模板列的候选源列；返回 {模板列: [ {source, col, score, how, filled}, ... ]}。"""
     mapping = mapping or {}

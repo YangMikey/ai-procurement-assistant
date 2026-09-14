@@ -172,4 +172,13 @@ if os.path.exists(KF):
 else:
     check("真实文件：钥匙表_采购项目汇总.xlsx 存在", False)
 
+# ---- 回归：列供给下拉标签（曾有 KeyError: 'name'——候选字典无 name 字段） ----
+from core.table_filler import supply_option_label
+_srcs = [{"name": "源A", "df": s1}, {"name": "源B", "df": s2}]
+_sup2 = discover_supply(["金额"], _srcs, 70)
+_lbls = [supply_option_label(c, _srcs) for c in _sup2["金额"]]
+check("列供给标签：用源表名格式且不报错",
+      len(_lbls) >= 1 and all("【" in x and "(" in x for x in _lbls)
+      and any(x.startswith("源B") for x in _lbls))
+
 print(f"\n===== 多表补全测试通过：{ok} 项断言（离线）=====")

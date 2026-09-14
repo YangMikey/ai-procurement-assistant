@@ -66,7 +66,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-14.11"
+BUILD = "2026-09-14.12"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -954,14 +954,13 @@ elif mode == "多表补全":
         except Exception:
             pass
 
-        from core.table_filler import discover_supply as _disc
+        from core.table_filler import discover_supply as _disc, supply_option_label as _lbl
         _tcols2 = [c for c in _tpl_df.columns if c not in _tkeys]
         _sup = _disc(_tcols2, _sources, float(_thr2))
         _mapping2 = {}
         for _tcol in _tcols2:
             _cands = _sup.get(_tcol) or []
-            _opts = ["不补"] + [f"{_c['name']}【{_c['col']}】({_c['how']},{_c['score']:.0f})"
-                                for _c in _cands]
+            _opts = ["不补"] + [_lbl(_c, _sources) for _c in _cands]
             _def = 1 if _cands else 0
             _pickc2 = st.selectbox(f"「{_tcol}」←", _opts, index=_def,
                                    key=file_key("mfmap", _tcol, _thr2))
