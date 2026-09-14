@@ -40,6 +40,7 @@ from core.parser_rule import manual_quote, parse_quote_file
 from core.parser_llm import parse_quote_auto
 from core.templater import fill_template
 from core.registry import list_skills
+from core.table_filler import COLORS as FILL_COLORS, export_filled, fill_multi
 from ui_components import browse_file_path, file_key, pick_columns, pick_header_row
 
 st.set_page_config(page_title="AI 采购助理", page_icon="🧰", layout="wide")
@@ -64,7 +65,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-14.6"
+BUILD = "2026-09-14.7"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -127,7 +128,7 @@ if not st.session_state.get("_boot_logged"):
     log_line(f"app started · build {BUILD} · python {sys.version.split()[0]} · streamlit {st.__version__}")
     st.session_state["_boot_logged"] = True
 
-mode = st.sidebar.radio("任务模式", ["两表匹配补缺", "仅换算", "仅对齐", "完整比价"])
+mode = st.sidebar.radio("任务模式", ["两表匹配补缺", "仅换算", "仅对齐", "完整比价", "多表补全"])
 st.sidebar.caption(f"build {BUILD}")
 st.sidebar.caption("数据本地处理，不上传任何服务器；LLM 功能默认关闭。")
 st.sidebar.caption("写回原文件前自动建「ai副本」备份；文件被 WPS 占用会提示。")
@@ -880,3 +881,107 @@ elif mode in ("仅对齐", "完整比价"):
                 st.error(f"建议生成出错：{e}")
     else:
         st.caption("样例数据：tests/synth_quotes.py（4 家 × 格式变体 + 脏数据 + ground truth）")
+
+elif mode == "多表补全":
+    st.header("🧩 多表补全（按模板汇总多张表）")
+    st.caption("你给模板（第 1 列=钥匙，其余=要补的列）+ 若干源表（各含钥匙列）；"
+               "自动发现哪张源表能供哪个列 → 按钥匙填充 → **按置信度上色** → 表格下方备注。"
+               "只产出新文件，不动原表。")
+
+    _ROOT_DIR2 = os.path.dirname(os.path.abspath(__file__))
+    _RAW_DIR2 = os.path.join(_ROOT_DIR2, "data", "raw_quotes")
+    _OUT_DIR2 = os.path.join(_ROOT_DIR2, "data", "outputs")
+
+    st.subheader("① 模板表")
+    _tpl_src = file_input("tpl", "模板表")
+    _tpl_df, _tk = None, None
+    if _tpl_src:
+        _tpl_df, _tpl_sheet, _tpl_hdr = load_table(_tpl_src, file_key("tpl", _tpl_src["name"], _tpl_src["path"]))
+        if _tpl_df is not None and len(_tpl_df.columns):
+            _tk = pick_columns(_tpl_df, "🔑 模板·钥匙列（一般第 1 列）", mode="single",
+                               key=file_key("tplkey", _tpl_src["name"], _tpl_sheet, _tpl_hdr))
+            _tk = _tk[0] if _tk else _tpl_df.columns[0]
+            st.caption(f"模板：{len(_tpl_df)} 行 × {len(_tpl_df.columns)} 列；钥匙列 = **{_tk}**；"
+                       f"待补列：{'、'.join(c for c in _tpl_df.columns if c != _tk)}")
+
+    st.subheader("② 源表（可多张）")
+    _src_kind = st.radio("源表来源", ["上传文件（可多选）", "从项目 raw_quotes 目录选"],
+                         horizontal=True, key="mf_srckind")
+    _src_files = []      # [(name, bytes_or_path, is_path)]
+    if _src_kind.startswith("上传"):
+        _ups2 = st.file_uploader("上传源表（xlsx/xls/csv，可多选）", type=UP_TYPES,
+                                 accept_multiple_files=True, key="mf_up")
+        _src_files = [(u.name, u.getvalue(), False) for u in (_ups2 or [])]
+    else:
+        _files2 = sorted(f for f in os.listdir(_RAW_DIR2)
+                         if f.lower().endswith((".xlsx", ".xlsm", ".xls", ".csv"))) if os.path.isdir(_RAW_DIR2) else []
+        _pick2 = st.multiselect("选择源表文件（可多选）", _files2, default=_files2, key="mf_pick")
+        _src_files = [(f, os.path.join(_RAW_DIR2, f), True) for f in _pick2]
+
+    _sources = []
+    for _i, (_nm, _data, _is_path) in enumerate(_src_files):
+        _s = ({"mode": "path", "path": _data, "bytes": open(_data, "rb").read(), "name": _nm}
+              if _is_path else {"mode": "upload", "path": None, "bytes": _data, "name": _nm})
+        with st.expander(f"源表 {_i + 1}：{_nm}", expanded=(len(_src_files) == 1)):
+            _df2, _sh2, _hdr2 = load_table(_s, file_key("mf", _nm, _i))
+            if _df2 is None or not len(_df2.columns):
+                continue
+            _kc = pick_columns(_df2, "🔑 该源表·钥匙列", mode="single",
+                               key=file_key("mfkey", _nm, _sh2, _hdr2, _i))
+            _kc = _kc[0] if _kc else _df2.columns[0]
+            st.caption(f"钥匙列 = **{_kc}**｜可用列：{'、'.join(str(c) for c in _df2.columns if c != _kc)}")
+            _sources.append({"name": _nm, "df": _df2, "key_col": _kc})
+
+    if _tpl_df is not None and _tk and _sources:
+        st.subheader("③ 列供给（自动发现，可改）")
+        _thr2 = st.slider("列名匹配阈值（默认 70；越低越容易对上）", 50, 100, 70, key="mf_thr")
+        _kmin2 = st.slider("钥匙最低相似度（低于此视为未匹配→留空）", 0, 60, 20, key="mf_kmin")
+        from core.table_filler import discover_supply as _disc
+        _sup = _disc([c for c in _tpl_df.columns if c != _tk], _sources, float(_thr2))
+        _mapping2 = {}
+        for _tcol in [c for c in _tpl_df.columns if c != _tk]:
+            _cands = _sup.get(_tcol) or []
+            _opts = ["不补"] + [f"{_c['name']}【{_c['col']}】({_c['how']},{_c['score']:.0f})"
+                                for _c in _cands]
+            _def = 1 if _cands else 0
+            _pickc2 = st.selectbox(f"「{_tcol}」←", _opts, index=_def,
+                                   key=file_key("mfmap", _tcol, _thr2))
+            if _pickc2 != "不补":
+                _idx2 = _opts.index(_pickc2) - 1
+                _c2 = _cands[_idx2]
+                _mapping2[_tcol] = (_c2["source"], _c2["col"])
+        st.caption("颜色图例：" + "；".join([
+            "无色=完全匹配(100%)", "浅黄=高置信(80–99%)", "浅灰=中置信(40–80%)",
+            "浅蓝=低置信(20–40%)", "浅红底空格=未匹配"]))
+
+        if st.button("生成补全表", type="primary", key="mf_go"):
+            try:
+                with st.spinner("填充中…"):
+                    _res2 = fill_multi(_tpl_df, _tk, _sources, mapping=_mapping2,
+                                       col_threshold=float(_thr2), key_min=float(_kmin2))
+                st.session_state["mf_res"] = _res2
+            except Exception as e:
+                log_exception("多表补全失败", e)
+                st.error(f"补全出错（已记日志）：{e}")
+
+        _mfres = st.session_state.get("mf_res")
+        if _mfres:
+            st.subheader("④ 结果（预览见下方；下载件带颜色与备注）")
+            _st2 = _mfres["stats"]
+            st.caption(f"完全匹配 {_st2['完全匹配(100%)']}｜高置信 {_st2['高置信(80-99%)']}｜"
+                       f"中置信 {_st2['中置信(40-80%)']}｜低置信 {_st2['低置信(20-40%)']}｜"
+                       f"未匹配(留空) {_st2['未匹配(留空)']}｜有未补全格的行：{_st2['未补全行数']}")
+            st.dataframe(_mfres["result"], height=420, width="stretch")
+            try:
+                os.makedirs(_OUT_DIR2, exist_ok=True)
+                _fn2 = f"多表补全_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
+                _out2 = os.path.join(_OUT_DIR2, _fn2)
+                export_filled(_mfres["result"], _mfres["confidence"], _out2, stats=_st2)
+                with open(_out2, "rb") as _fh2:
+                    st.download_button("⬇️ 下载补全表（带颜色与备注）", _fh2.read(), file_name=_fn2,
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       key="mf_dl")
+                st.success(f"已导出到项目内：data\\outputs\\{_fn2}")
+            except Exception as e:
+                log_exception("多表补全导出失败", e)
+                st.error(f"导出出错（已记日志）：{e}")

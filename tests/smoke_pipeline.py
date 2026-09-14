@@ -408,6 +408,18 @@ check("B：错配预警接入（低置信度→疑似错配）",
       advise(pd.DataFrame({"品名": ["阀门"], "甲": [10.0], "乙": [11.0], "丙": [10.5]}),
              ["甲", "乙", "丙"], low_confidence=[{"品名": "阀门"}])["rows"].iloc[0]["预警"] == "疑似错配")
 
+# ---- 4.20 多表补全（新技能） ----
+from core.table_filler import fill_multi as _fill_multi, col_match as _col_match
+_tpl7 = pd.DataFrame({"供应商": ["甲", "乙"], "合同截止时间": ["", ""]})
+_s17 = pd.DataFrame({"单位": ["甲"], "合同结束时间": ["2026-12-31"]})
+_r7 = _fill_multi(_tpl7, "供应商", [{"name": "s1", "df": _s17, "key_col": "单位"}])
+check("多表补全：同义列名（结束↔截止）能供给并填充",
+      _r7["result"].loc[0, "合同截止时间"] == "2026-12-31"
+      and str(_r7["confidence"].loc[0, "合同截止时间"]).startswith("ok"))
+check("多表补全：未匹配行留空（miss）", str(_r7["result"].loc[1, "合同截止时间"]).strip() == ""
+      and str(_r7["confidence"].loc[1, "合同截止时间"]).startswith("miss"))
+check("多表补全：含税/不含税列名判为冲突", _col_match("含税单价", "不含税单价")[1] == "冲突")
+
 # ---- 5. 与 ground truth 核对（A 基准价=浮动 0） ----
 import json
 with open(os.path.join(S, "ground_truth.json"), encoding="utf-8") as f:
