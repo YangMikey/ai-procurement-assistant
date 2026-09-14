@@ -247,11 +247,22 @@ C:\Users\zq130\Desktop\ai模型\          ← 本项目根（所有文件只放�
 - **`tests/experiment_parser_llm.py`（9 断言，离线）**：非标触发 LLM、映射生效、标准件零调用、未启用退回、乱码安全退回
 - 冒烟 **83 断言**；**9 套测试连跑两遍全过**；AppTest 三模式 0 异常/0 错误；build → **2026-09-14.4**
 
+## 已完成（2026-09-14 收尾 A：文档 + GitHub 作品集）
+
+- **README.md 重写**（作品集级）：定位/痛点/三模式/架构/快速开始/目录/**9 套测试与证据表**/隐私/路线图
+- **PRD v0.3**：新增「实现状态」表（F01–F19 逐项 ✅/🟡/❌）与「LLM 的定位与边界」；迭代路线同步
+- **仓库发布**：`https://github.com/YangMikey/ai-procurement-assistant`（**public**，默认分支 main）
+  - 署名：`Zhiqian Yang <YangMikey@users.noreply.github.com>`；本地（仅本仓库）已设 `http.version=HTTP/1.1`、`http.sslBackend=schannel`
+  - `.gitignore` 排除真实数据/日志/产出/缓存：远端核验 `data/` 仅含 `README.md / llm_config.json / samples`（无 ground_truth / raw_quotes）
+  - 推送环境注记：github.com:443 国内偶发连不上（api.github.com 正常）→ 重试 + 上述 git 配置可稳过
+- 待办：**真机 hold-out**（把原始逐家报价单放 `data/raw_quotes/` → 跑真实解析准确率，作品集最有说服力的证据）
+
 ## 下一步（按优先级）
 
-0. **用户验收（全程）**：重启 bat（侧栏 build 2026-09-14.4）→ 三个模式跑真实文件；LLM 已开（opencode Go · DeepSeek V4.1 Flash），非标文件会自动走 LLM
-1. **可选增强**：M2d 标色回测（低价值，待用户澄清标色含义）；F17 模板整合输出；F16 手动报价录入；GitHub 作品集打包
-2. **收尾**：README/作品集说明、真机 hold-out（用户提供原始报价单放 `data/raw_quotes/`）
+0. **用户验收（全程）**：重启 bat（侧栏 build 2026-09-14.4）→ 三模式跑真实文件；LLM 已开（opencode Go · DeepSeek V4.1 Flash）
+1. **真机 hold-out**：`data/raw_quotes/` 投放原始报价单 → 跑解析准确率 + 分层报告
+2. **可选功能**：F16 手动报价录入 / F17 模板整合输出 / F10 二次报价趋势 / F01「仅对齐」入口 / F09·F11 的 LLM 版
+3. **作品集打磨**：README 加截图/GIF、GitHub 仓库 About/Topics、可考虑 release 打包
 
 ## 求职主线关联（勿丢）
 
