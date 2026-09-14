@@ -23,6 +23,7 @@ import pandas as pd
 
 import core as _core
 from core.advisor_rule import advise
+from core.advisor_llm import advise_llm
 from core.aligner import align_quotes
 from core.excel_io import (backup_sheet_numbered, detect_header_block_bottom,
                            export_df_bytes, get_sheet_names, list_sheets_from_bytes,
@@ -35,8 +36,9 @@ from core.highlighter import PRESETS, export_highlighted
 from core.llm_client import (CACHE_PATH as LLM_CACHE_PATH, DEFAULT_MODEL,
                              LLMClient, PROVIDER_PRESETS, load_config, save_config)
 from core.matcher import run_match
-from core.parser_rule import parse_quote_file
+from core.parser_rule import manual_quote, parse_quote_file
 from core.parser_llm import parse_quote_auto
+from core.templater import fill_template
 from core.registry import list_skills
 from ui_components import browse_file_path, file_key, pick_columns, pick_header_row
 
@@ -62,7 +64,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-14.4"
+BUILD = "2026-09-14.5"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -125,7 +127,7 @@ if not st.session_state.get("_boot_logged"):
     log_line(f"app started · build {BUILD} · python {sys.version.split()[0]} · streamlit {st.__version__}")
     st.session_state["_boot_logged"] = True
 
-mode = st.sidebar.radio("任务模式", ["两表匹配补缺", "仅换算", "完整比价"])
+mode = st.sidebar.radio("任务模式", ["两表匹配补缺", "仅换算", "仅对齐", "完整比价"])
 st.sidebar.caption(f"build {BUILD}")
 st.sidebar.caption("数据本地处理，不上传任何服务器；LLM 功能默认关闭。")
 st.sidebar.caption("写回原文件前自动建「ai副本」备份；文件被 WPS 占用会提示。")
@@ -622,10 +624,15 @@ elif mode == "仅换算":
                 elif src["mode"] == "path":
                     st.info("该文件不是 xlsx/xlsm（xls/csv），不支持原位写回，请用下载结果。")
 
-else:
-    st.header("📊 完整比价")
-    st.caption("多份报价单 → 解析 → 对齐成矩阵 → 口径统一 → 最低价标红 → 采购建议。"
-               "默认按**不含税**比价；报价单不出本机。")
+elif mode in ("仅对齐", "完整比价"):
+    _align_only = (mode == "仅对齐")
+    if _align_only:
+        st.header("🔗 仅对齐（多份报价 → 对齐成矩阵）")
+        st.caption("只做解析 + 对齐，产出比价矩阵（不标红/不出建议）；默认按**不含税**对齐。")
+    else:
+        st.header("📊 完整比价")
+        st.caption("多份报价单 → 解析 → 对齐成矩阵 → 口径统一 → 最低价标红 → 采购建议。"
+                   "默认按**不含税**比价；报价单不出本机。")
 
     _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
     _RAW_DIR = os.path.join(_ROOT_DIR, "data", "raw_quotes")
@@ -656,6 +663,25 @@ else:
 
     _use_llm_parse = st.checkbox("🤖 非标文件用 LLM 解析（规则认不出时；需侧栏已启用 LLM）",
                                  value=bool(_llm_client.enabled), key="cmp_llmparse")
+
+    with st.expander("✍️ 手动录入报价（F16 · 口头/微信报价等）", expanded=False):
+        _msup = st.text_input("供应商名", key="cmp_msup", placeholder="如：利源通")
+        _mrow = st.data_editor(
+            pd.DataFrame([{"品名": "", "规格": "", "单位": "", "数量": "", "价格": "", "税率": "13"}]),
+            num_rows="dynamic", width="stretch", key="cmp_meditor")
+        _mfield = st.radio("价格口径", ["含税单价", "不含税单价"], horizontal=True, key="cmp_mfield")
+        if st.button("＋ 加入报价", key="cmp_madd"):
+            _rows = [dict(r) for _, r in _mrow.iterrows()
+                     if str(r.get("品名", "")).strip() or str(r.get("价格", "")).strip()]
+            if not _rows:
+                st.warning("请至少填一行（品名/价格）")
+            else:
+                _mq = manual_quote(_msup or "手动录入", _rows, price_field=_mfield)
+                _cur = st.session_state.get("cmp_quotes") or []
+                _cur.append(_mq)
+                st.session_state["cmp_quotes"] = _cur
+                st.success(f"已加入手动报价：{_mq['supplier']}（{len(_mq['df'])} 行）")
+
     if st.button("解析报价单", type="primary", disabled=not (_paths or _uploads), key="cmp_parse"):
         _quotes = []
         _used_llm = False
@@ -728,7 +754,7 @@ else:
 
         if _cres["low_confidence"]:
             with st.expander(f"🧠 人工确认 · 低/中置信度对齐（{len(_cres['low_confidence'])} 项）"):
-                st.caption("确认后写入本地经验库；下次同样的异名**第①级直接命中**。")
+                st.caption("确认后写入本地经验库；下次同样的异名走**经验库兜底**。")
                 for _i, _it in enumerate(_cres["low_confidence"][:40]):
                     _c1, _c2 = st.columns([5, 1])
                     _c1.markdown(f"**{_it['supplier']}**：`{_it['品名']}` → 对齐到 `{_it['对齐到']}`"
@@ -741,48 +767,114 @@ else:
                             log_exception("比价经验库写入失败", e)
                             st.error(f"写入失败：{e}")
 
-        st.subheader("④ 标红颜色")
-        _names = [p[0] for p in PRESETS]
-        _c1, _c2, _c3 = st.columns([2, 2, 2])
-        with _c1:
-            _pickc = st.selectbox("配色（浅色彩虹）", _names + ["自定义"],
-                                  index=_names.index("浅黄"), key="cmp_color")
-        if _pickc == "自定义":
-            with _c2:
-                _fill = st.color_picker("底色", "#FFEB9C", key="cmp_fill")
-            with _c3:
-                _font = st.color_picker("字色", "#9C6500", key="cmp_font")
-        else:
-            _fill = dict((p[0], p[1]) for p in PRESETS)[_pickc]
-            _font = dict((p[0], p[2]) for p in PRESETS)[_pickc]
-            with _c2:
-                st.markdown(f"<span style='background:{_fill};color:{_font};padding:4px 10px;"
-                            f"border-radius:4px'>示例：最低价</span>", unsafe_allow_html=True)
-
-        if st.button("标红并导出比价表", type="primary", key="cmp_export"):
+        if _align_only:
+            st.subheader("④ 导出对齐矩阵")
             try:
                 os.makedirs(_OUT_DIR, exist_ok=True)
-                _fn = f"比价结果_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
-                _out = os.path.join(_OUT_DIR, _fn)
-                export_highlighted(_m, _cres["suppliers"], _out, min_fill=_fill, min_font=_font)
-                log_line(f"比价导出：{_out}")
-                with open(_out, "rb") as _fh:
-                    st.download_button("⬇️ 下载比价表", _fh.read(), file_name=_fn,
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                       key="cmp_dl")
+                _fn = f"对齐矩阵_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
+                _bytes = export_df_bytes(_m, sheet_name="对齐矩阵")
+                with open(os.path.join(_OUT_DIR, _fn), "wb") as _fh:
+                    _fh.write(_bytes)
+                st.download_button("⬇️ 下载对齐矩阵", _bytes, file_name=_fn,
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   key="cmp_align_dl")
                 st.success(f"已导出到项目内：data\\outputs\\{_fn}")
             except Exception as e:
-                log_exception("比价导出失败", e)
+                log_exception("对齐矩阵导出失败", e)
                 st.error(f"导出出错（已记日志）：{e}")
+        else:
+            st.subheader("④ 标红颜色")
+            _names = [p[0] for p in PRESETS]
+            _c1, _c2, _c3 = st.columns([2, 2, 2])
+            with _c1:
+                _pickc = st.selectbox("配色（浅色彩虹）", _names + ["自定义"],
+                                      index=_names.index("浅黄"), key="cmp_color")
+            if _pickc == "自定义":
+                with _c2:
+                    _fill = st.color_picker("底色", "#FFEB9C", key="cmp_fill")
+                with _c3:
+                    _font = st.color_picker("字色", "#9C6500", key="cmp_font")
+            else:
+                _fill = dict((p[0], p[1]) for p in PRESETS)[_pickc]
+                _font = dict((p[0], p[2]) for p in PRESETS)[_pickc]
+                with _c2:
+                    st.markdown(f"<span style='background:{_fill};color:{_font};padding:4px 10px;"
+                                f"border-radius:4px'>示例：最低价</span>", unsafe_allow_html=True)
 
-        st.subheader("⑤ 采购建议（规则版）")
-        try:
-            _adv = advise(_m, _cres["suppliers"])
-            for _t in _adv["text"]:
-                st.markdown(_t)
-            st.dataframe(_adv["rows"], height=260, width="stretch")
-        except Exception as e:
-            log_exception("采购建议失败", e)
-            st.error(f"建议生成出错：{e}")
+            if st.button("标红并导出比价表", type="primary", key="cmp_export"):
+                try:
+                    os.makedirs(_OUT_DIR, exist_ok=True)
+                    _fn = f"比价结果_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
+                    _out = os.path.join(_OUT_DIR, _fn)
+                    export_highlighted(_m, _cres["suppliers"], _out, min_fill=_fill, min_font=_font)
+                    log_line(f"比价导出：{_out}")
+                    with open(_out, "rb") as _fh:
+                        st.download_button("⬇️ 下载比价表", _fh.read(), file_name=_fn,
+                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                           key="cmp_dl")
+                    st.success(f"已导出到项目内：data\\outputs\\{_fn}")
+                except Exception as e:
+                    log_exception("比价导出失败", e)
+                    st.error(f"导出出错（已记日志）：{e}")
+
+            with st.expander("📄 按模板整合输出（F17 · 套上级模板）", expanded=False):
+                _tpl = st.file_uploader("上传模板 xlsx（预留表头/样式）", type=["xlsx"], key="cmp_tpl")
+                if _tpl:
+                    try:
+                        _tsheets = list_sheets_from_bytes(_tpl.getvalue(), _tpl.name)
+                    except Exception:
+                        _tsheets = ["Sheet1"]
+                    _c1, _c2, _c3 = st.columns([2, 2, 3])
+                    with _c1:
+                        _tsheet = st.selectbox("写入 Sheet", _tsheets, key="cmp_tpl_sheet")
+                    with _c2:
+                        _tcell = st.text_input("起始单元格", value="A3", key="cmp_tpl_cell")
+                    with _c3:
+                        _ttitle = st.text_input("标题（可选）", value="", key="cmp_tpl_title")
+                    if st.button("生成模板文件", key="cmp_tpl_go"):
+                        try:
+                            _bytes, _info = fill_template(
+                                _tpl.getvalue(), _m, sheet=_tsheet, start_cell=_tcell,
+                                title=(_ttitle or None))
+                            _fn = f"比价_模板输出_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
+                            with open(os.path.join(_OUT_DIR, _fn), "wb") as _fh:
+                                _fh.write(_bytes)
+                            st.download_button("⬇️ 下载模板输出", _bytes, file_name=_fn,
+                                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                               key="cmp_tpl_dl")
+                            st.success(f"已写入 {_info['sheet']} {_info['start']}~{_info['end']}"
+                                       f"（{_info['rows']} 行 × {_info['cols']} 列）")
+                        except Exception as e:
+                            log_exception("模板输出失败", e)
+                            st.error(f"模板输出出错：{e}")
+
+            st.subheader("⑤ 采购建议")
+            try:
+                _adv = advise(_m, _cres["suppliers"], low_confidence=_cres.get("low_confidence"))
+                for _t in _adv["text"]:
+                    st.markdown(_t)
+                st.dataframe(_adv["rows"], height=260, width="stretch")
+                if _llm_client.enabled:
+                    if st.button("🤖 用 LLM 生成建议（F09 · 额外消耗约 $0.002~0.005/次）", key="cmp_advllm"):
+                        with st.spinner("LLM 分析中…"):
+                            _r = advise_llm(_m, _cres["suppliers"], _llm_client, rule_advice=_adv)
+                        if _r.get("error"):
+                            st.error(f"LLM 建议失败：{_r['error']}")
+                        else:
+                            st.markdown("##### 🤖 LLM 采购建议")
+                            st.markdown(_r["text"])
+                            st.caption(f"消耗约 ${_r['cost_usd']:.4f}｜缓存命中：{_r.get('cached')}")
+                            try:
+                                _fn = f"采购建议_LLM_{_dt.now():%Y%m%d_%H%M%S}.txt"
+                                with open(os.path.join(_OUT_DIR, _fn), "w", encoding="utf-8") as _f:
+                                    _f.write(_r["text"])
+                                st.caption(f"已存 data\\outputs\\{_fn}")
+                            except Exception:
+                                pass
+                else:
+                    st.caption("（侧栏启用 LLM 后，可一键用 LLM 生成建议）")
+            except Exception as e:
+                log_exception("采购建议失败", e)
+                st.error(f"建议生成出错：{e}")
     else:
         st.caption("样例数据：tests/synth_quotes.py（4 家 × 格式变体 + 脏数据 + ground truth）")

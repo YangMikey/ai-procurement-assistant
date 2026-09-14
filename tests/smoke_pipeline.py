@@ -387,6 +387,27 @@ _qr, _ur = _pqa(path=os.path.join(S, "报价单A_标准格式.xlsx"), llm=_fr)
 check("非标解析：标准件规则优先不调用 LLM", _ur is False and _fr.calls == 0)
 os.remove(TMP5)
 
+# ---- 4.19 路线B：手动录入 / 模板输出 / 错配预警 ----
+from core.parser_rule import manual_quote
+from core.templater import fill_template
+import io as _io
+_qm = manual_quote("X供应商", [{"品名": "螺钉", "规格": "M4", "单位": "包", "数量": 2,
+                                "价格": "11.3", "税率": "13"}], price_field="含税单价")
+check("B：手动录入解析为规范表（价格/税率）",
+      _qm["via"] == "manual" and abs(_qm["df"]["含税单价"].iloc[0] - 11.3) < 1e-9
+      and abs(_qm["df"]["税率"].iloc[0] - 0.13) < 1e-9)
+_wb6 = _WB(); _ws6 = _wb6.active; _ws6["A1"] = "模板"
+_b6 = _io.BytesIO(); _wb6.save(_b6)
+_mx6 = pd.DataFrame({"品名": ["螺钉"], "利源通": [10.0]})
+_out6, _info6 = fill_template(_b6.getvalue(), _mx6, start_cell="A3")
+_wb7 = load_workbook(_io.BytesIO(_out6))
+check("B：模板输出写入且保留原内容",
+      _wb7.active["A1"].value == "模板" and _wb7.active["A3"].value == "品名"
+      and _wb7.active["A4"].value == "螺钉")
+check("B：错配预警接入（低置信度→疑似错配）",
+      advise(pd.DataFrame({"品名": ["阀门"], "甲": [10.0], "乙": [11.0], "丙": [10.5]}),
+             ["甲", "乙", "丙"], low_confidence=[{"品名": "阀门"}])["rows"].iloc[0]["预警"] == "疑似错配")
+
 # ---- 5. 与 ground truth 核对（A 基准价=浮动 0） ----
 import json
 with open(os.path.join(S, "ground_truth.json"), encoding="utf-8") as f:

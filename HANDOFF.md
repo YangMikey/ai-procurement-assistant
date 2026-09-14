@@ -257,12 +257,24 @@ C:\Users\zq130\Desktop\ai模型\          ← 本项目根（所有文件只放�
   - 推送环境注记：github.com:443 国内偶发连不上（api.github.com 正常）→ 重试 + 上述 git 配置可稳过
 - 待办：**真机 hold-out**（把原始逐家报价单放 `data/raw_quotes/` → 跑真实解析准确率，作品集最有说服力的证据）
 
+## 已完成（2026-09-14 路线B，功能补齐）
+
+- **F01 仅对齐**：新增第 4 个任务模式（复用比价的对齐段，产出并导出对齐矩阵，不做标红/建议）
+- **F16 手动报价录入**：完整比价页「✍️ 手动录入报价」（供应商名 + 可编辑表 + 价格口径）→ `parser_rule.manual_quote()` 产出与解析器同结构，直接并入对齐
+- **F17 模板整合输出**：`core/templater.py::fill_template()` —— 上传模板 xlsx、指定 Sheet/起始单元格/标题，整块写入（保留模板格式），落 `data/outputs/`
+- **F09 LLM 采购建议**：`core/advisor_llm.py::advise_llm()` —— 规则版结论作上下文，LLM 出①成本②风险③谈判；复用 llm_client（缓存/成本/上限）。实测一次约 **$0.0039**
+- **F11 疑似品类错配**：`advisor_rule.advise(low_confidence=...)` 接入对齐低置信度 → 「疑似错配」预警 + 文案
+- **公共重构**：`parser_rule.build_canonical()` 抽出（rule/llm/manual 共用）
+- **新测试** `tests/experiment_features_b.py`（13 断言，离线）；冒烟扩至 **86 断言**；**10 套测试连跑两遍全过**；AppTest 4 模式 + 仅对齐 UI 流程 0 异常/0 错误；build → **2026-09-14.5**
+- **PRD/README 同步**：状态表 F01/F09/F11/F16/F17 → ✅；README 增「手动录入/仅对齐/模板输出/LLM 建议」与测试表
+- **仍缺**：F10 二次报价趋势（需多轮价格数据模型，另行评估）
+
 ## 下一步（按优先级）
 
-0. **用户验收（全程）**：重启 bat（侧栏 build 2026-09-14.4）→ 三模式跑真实文件；LLM 已开（opencode Go · DeepSeek V4.1 Flash）
-1. **真机 hold-out**：`data/raw_quotes/` 投放原始报价单 → 跑解析准确率 + 分层报告
-2. **可选功能**：F16 手动报价录入 / F17 模板整合输出 / F10 二次报价趋势 / F01「仅对齐」入口 / F09·F11 的 LLM 版
-3. **作品集打磨**：README 加截图/GIF、GitHub 仓库 About/Topics、可考虑 release 打包
+0. **用户一次性验收**：重启 bat（侧栏 build 2026-09-14.5）→ 4 模式跑真实文件；LLM 已开（opencode Go · DeepSeek V4.1 Flash）
+1. **真机 hold-out**：原始报价单放 `data/raw_quotes/` → 跑真实解析准确率 + 分层报告
+2. **仓库打磨**：About/Topics（待办）；README 可加截图/GIF
+3. **可选**：F10 二次报价趋势；F12 意图路由；F13 Word/PDF
 
 ## 求职主线关联（勿丢）
 

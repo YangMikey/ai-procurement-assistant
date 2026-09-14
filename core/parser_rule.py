@@ -275,3 +275,22 @@ def _list_sheets(path, data, filename):
     names = wb.sheetnames
     wb.close()
     return names
+
+
+def manual_quote(supplier, rows, price_field="含税单价"):
+    """【F16 手动报价录入】把界面键入的报价转成与解析器同结构的一条报价。
+
+    rows: [{"品名","规格","单位","数量","价格","税率"}, ...]
+    price_field: 键入的"价格"属于哪个口径（含税单价/不含税单价）；另一口径由税率推算。
+    """
+    heads = ["品名", "规格", "单位", "数量", "价格", "税率"]
+    data = pd.DataFrame([[r.get(h, "") for h in heads] for r in rows])   # 位置列 0..n
+    idx = {h: i for i, h in enumerate(heads)}
+    mapping = {"品名": idx["品名"], "规格": idx["规格"], "单位": idx["单位"],
+               "数量": idx["数量"], price_field: idx["价格"], "税率": idx["税率"]}
+    warnings = [f"手动录入（价格口径：{price_field}）"]
+    df, warnings = build_canonical(heads, data, mapping, warnings)
+    return {"supplier": str(supplier).strip() or "手动录入", "sheet": "(手动录入)",
+            "header_row": 1, "df": df,
+            "mapping": {k: heads[v] for k, v in mapping.items()},
+            "warnings": warnings, "source": "manual", "via": "manual"}
