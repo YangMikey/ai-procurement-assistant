@@ -142,9 +142,8 @@ def style_sheet(ws, header_row=1, *, autosize=True, freeze=True, autofilter=True
 
 
 def footer_lines(source="", sheet="", extra=None):
+    """表下页脚：只写生成时间（+可选图例/说明）；不再写"来源"。"""
     lines = [f"生成时间：{_dt.datetime.now():%Y-%m-%d %H:%M}"]
-    if source:
-        lines.append(f"来源：{source}" + (f" · Sheet「{sheet}」" if sheet else ""))
     lines += list(extra or [])
     return lines
 
