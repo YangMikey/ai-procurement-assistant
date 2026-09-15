@@ -70,11 +70,34 @@ try:
 except Exception:
     pass
 
-# 真跑一次「生成补全表」：走完 自动配钥匙 → 级联 → 复验 → 清单 全链路
+# 真跑一次「生成补全表」：走完 自动配钥匙 → 级联 → 复验 → 清单 → 抽查区 全链路
 if at.button(key="mf_go"):
     at.button(key="mf_go").click()
     at.run()
     check("UI：点「生成补全表」跑完全链路无异常", len(at.exception) == 0 and not at.error)
+
+# 多表补全：源表来源切到「粘贴文件路径」（新增分支）应能渲染
+try:
+    at.radio(key="mf_srckind").set_value("粘贴文件路径")
+    at.run()
+    check("UI：源表来源=粘贴文件路径 渲染无异常", len(at.exception) == 0 and not at.error)
+    _p = os.path.join(_ROOT, "data", "ground_truth", "001.xlsx")
+    if os.path.exists(_p) and at.text_area(key="mf_paths"):
+        at.text_area(key="mf_paths").set_value(_p)
+        at.run()
+        check("UI：粘贴存在的路径后 渲染无异常", len(at.exception) == 0 and not at.error)
+except Exception:
+    pass
+# 完整比价：报价单来源切到「粘贴文件路径」（新增浏览按钮分支）
+try:
+    at.sidebar.radio[0].set_value("完整比价")
+    at.run()
+    at.radio(key="cmp_src").set_value("粘贴文件路径")
+    at.run()
+    check("UI：完整比价·粘贴文件路径 渲染无异常", len(at.exception) == 0 and not at.error)
+except Exception:
+    pass
+
 if at.exception:
     for e in at.exception:
         print("   E:", getattr(e, "value", e))

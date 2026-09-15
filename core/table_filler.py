@@ -234,6 +234,36 @@ def _key_sim(a, b):
 
 PROMOTE_MIN = 80.0        # 补出的值置信 ≥ 此分才允许"升级为钥匙"（级联用）
 MAX_ROUNDS = 4            # 级联最大轮数（提前收敛：某轮无新增即停）
+EXP_NS = "多表补全"        # 经验库命名空间（与两表匹配的键区分开）
+
+
+def exp_key_of(vals):
+    """经验库键：归一化后 \x1f 连接（与 ExperienceStore 存库口径一致）。"""
+    try:
+        from .experience import norm_vals as _exp_norm
+        return _exp_norm(vals)
+    except Exception:
+        return "\x1f".join("" if v is None else str(v) for v in vals)
+
+
+def exp_key_values(template_df, i, key_cols):
+    """界面写库用：与引擎 exp_key 完全同口径（键 = 命名空间 + 目标列 + 各行钥匙值）。
+
+    返回 dict 供 app 直接构造键；key_cols 由结果里的 `exp_key_cols` 给出。
+    """
+    return {str(c): ("" if not _has_value(template_df.at[i, c]) else str(template_df.at[i, c]))
+            for c in key_cols}
+
+
+def exp_key_for(template_df, i, tcol, key_cols):
+    """按引擎口径生成经验库左键（界面点「确认并记住」时调用）。"""
+    vals = [EXP_NS, str(tcol)]
+    for c in key_cols:
+        if str(c) == str(tcol):
+            continue
+        v = template_df.at[i, c]
+        vals.append("" if not _has_value(v) else str(v))
+    return exp_key_of(vals)
 
 
 def _has_value(v):
@@ -428,15 +458,50 @@ def _pick_row(rows, df, target_col, score, k, exact, blank_on_tie=False):
 
     - 取值相同 → 直接用第 1 条（不算歧义）
     - 取值不同 → tie_n>0；blank_on_tie=True 时返回 row=None（**留空交给人工，不猜**）
+    返回 (row_or_None, score, k, tie_n, exact, rows)：rows 供页面给候选值。
     """
     if len(rows) == 1:
-        return rows[0], score, k, 0, exact
+        return rows[0], score, k, 0, exact, rows
     vals = [df[target_col].iloc[j] if target_col in df.columns else None for j in rows]
     first = vals[0]
     same = all((pd.isna(a) and pd.isna(first)) or (a == first) for a in vals)
     if same:
-        return rows[0], score, k, 0, exact
-    return (None if blank_on_tie else rows[0]), min(score, 39.0), k, len(rows), exact
+        return rows[0], score, k, 0, exact, rows
+    return (None if blank_on_tie else rows[0]), min(score, 39.0), k, len(rows), exact, rows
+
+
+def _near_values(src, pairs, row_vals, target_col, lo=40.0, topn=3):
+    """「未补上」时给最接近的候选值（模糊相似度 ≥lo 的源表行，按相似度倒序去重）。
+
+    lo 比钥匙门槛(默认20)高、但比"能配上"的水平低 —— 只作**找线索**用，不参与自动填。
+    """
+    df = src["df"]
+    sub = [(tk, scol) for tk, scol, _ in pairs if row_vals.get(tk)]
+    if not sub or target_col not in df.columns:
+        return []
+    want = [row_vals[tk] for tk, _ in sub]
+    scored = []
+    for j in range(len(df)):
+        vals = [norm_text(df[c].iloc[j]) for _, c in sub]
+        if not all(vals):
+            continue
+        v = df[target_col].iloc[j]
+        if not _has_value(v):
+            continue
+        sims = [_key_sim(vals[x], want[x]) for x in range(len(sub))]
+        sc = sum(sims) / len(sims)
+        if sc >= lo:
+            scored.append((sc, str(v)))
+    scored.sort(key=lambda t: -t[0])
+    out, seen = [], set()
+    for sc, v in scored:
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append((round(sc, 1), v))
+        if len(out) >= topn:
+            break
+    return out
 
 
 def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on_tie=False):
@@ -502,7 +567,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                key_cols=None, max_rounds=MAX_ROUNDS, promote_min=PROMOTE_MIN,
                auto_keys=True, defer_single=True, audit_rounds=2, audit_seed=42,
                allow_domain=True, key_plan=None, _audit=False, max_keys=4,
-               blank_on_tie=True):
+               blank_on_tie=True, experience=None):
     """多源 → 模板 单向填充（自动配钥匙 + 分层钥匙 + 级联 + 复验）。
 
     - 模板钥匙列 ≤4 个（你点的列优先；不够时自动按"歧义率低→覆盖率高→列数少"补位）
@@ -511,6 +576,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     - 级联：最多 max_rounds 轮，某轮无新增即停；补出的值 ≥ promote_min 才可当钥匙（×0.9/跳）
     - 复验：另外用「少一把钥匙」的降级对照再跑一遍，定不出来/取值不同的格进「需人工确认」清单
     - blank_on_tie=True（默认）：命中多行且取值不同 → **留空**交人工（不猜第 1 条）
+    - experience：经验库实例（传了就启用）——人工确认过的格**下次自动填**、标 `·经验库`、不再问
+    - 返回 `choices`：多候选的**候选值**与"未补上"的**最接近 3 个候选**（供页面一键确认 → 写经验库）
     """
     sources = list(sources or [])
     mapping = mapping or {}
@@ -553,7 +620,32 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     n_fill = {"ok": 0, "high": 0, "mid": 0, "low": 0, "miss": 0}
     eff_rounds = 0       # 有效轮数 = 真正补出东西的轮数（"延后"不占轮）
     deferred_sources = set()
-    tie_cells = {}       # (i, col) -> (tie_n, k_used, how)：命中多行取值不同 → 留空待人工选
+    tie_cells = {}       # (i, col) -> (tie_n, k_used, how, [候选值], 源表名)
+    n_exp = 0            # 经验库命中格数
+
+    # ---- 经验库：键 = ("多表补全", 目标列, 该行各钥匙列的模板值) ----
+    exp_lut = {}
+    if experience is not None:
+        try:
+            exp_lut = experience.build_lookup()
+        except Exception:
+            exp_lut = {}
+    exp_cols = []
+    for pr in key_pairs:
+        for tk, _sc, _cs in pr:
+            tk = str(tk)
+            if tk in template_df.columns and tk not in exp_cols \
+                    and bool(template_df[tk].map(_has_value).any()):
+                exp_cols.append(tk)
+
+    def exp_key(i, tcol):
+        vals = [EXP_NS, str(tcol)]
+        for c in exp_cols:
+            if str(c) == str(tcol):          # 目标列自己不当钥匙
+                continue
+            v = template_df.at[i, c]
+            vals.append("" if not _has_value(v) else str(v))
+        return exp_key_of(vals)
 
     for r in range(1, int(max_rounds) + 1):
         # 本轮开始快照"可用钥匙"（本轮新补出的值下一轮才生效 → 级联逐轮推进、轮次可解释）
@@ -594,6 +686,20 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                 row_vals = avail_by_row.get(i) or {}
                 if not row_vals:
                     continue
+                # ---- 经验库优先：人工确认过的格 → 直接填，不再猜（标 ·经验库）----
+                if exp_lut:
+                    ek = exp_key(i, tcol)
+                    hit = exp_lut.get(ek) if ek else None
+                    if hit:
+                        result.at[i, tcol] = _norm_value(hit)
+                        tie_cells.pop((i, tcol), None)
+                        filled[(i, tcol)] = (100.0, 0, 1, 0)
+                        gen[(i, tcol)] = 0
+                        n_fill["ok"] += 1
+                        n_exp += 1
+                        round_fills.append((i, tcol, 100.0, 1, 0, "经验库"))
+                        progressed = True
+                        continue
                 best = None
                 tie_info = None
                 for si in active:
@@ -613,10 +719,16 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                                           blank_on_tie=blank_on_tie)
                         if not m:
                             continue
-                        j, sc, k_used, tie_n, exact = m
-                        if j is None:              # 命中多行且取值不同 → 不猜，记下来
+                        j, sc, k_used, tie_n, exact, hit_rows = m
+                        if j is None:              # 命中多行且取值不同 → 不猜，记下来（带候选值）
+                            vals = [str(s["df"][ccol].iloc[r]) for r in hit_rows
+                                    if _has_value(s["df"][ccol].iloc[r])]
+                            uniq = []
+                            for v in vals:
+                                if v not in uniq:
+                                    uniq.append(v)
                             if tie_info is None or tie_n > tie_info[0]:
-                                tie_info = (tie_n, k_used, cand["how"])
+                                tie_info = (tie_n, k_used, cand["how"], uniq[:3], s["name"])
                             continue
                         v = s["df"][ccol].iloc[j]
                         if not _has_value(v):
@@ -634,7 +746,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     filled[(i, tcol)] = (decayed, 0, k_used, tie_n)   # 轮次稍后回填
                     gen[(i, tcol)] = g + 1
                     n_fill[_band(decayed)] += 1
-                    round_fills.append((i, tcol, decayed, k_used, tie_n))
+                    round_fills.append((i, tcol, decayed, k_used, tie_n, ""))
                     progressed = True
                 elif tie_info is not None:
                     # 有几条候选但取值不同 → 宁可留空，交人工选（清单里写「多候选(已留空)」）
@@ -642,7 +754,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
 
         if progressed:
             eff_rounds += 1
-            for i, tcol, decayed, k_used, tie_n in round_fills:
+            for i, tcol, decayed, k_used, tie_n, src_tag in round_fills:
                 _sc0, _r0, _k0, _t0 = filled[(i, tcol)]
                 filled[(i, tcol)] = (decayed, eff_rounds, k_used, tie_n)
                 tag = f"{_band(decayed)}:{decayed:.0f}@{eff_rounds}"
@@ -650,6 +762,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     tag += f"·{k_used}钥匙"
                 if tie_n:
                     tag += f"·歧义{tie_n}行"
+                if src_tag:
+                    tag += f"·{src_tag}"
                 conf.at[i, tcol] = tag
         elif r == 1 and deferred_sources:
             continue                      # 第 1 轮只是"延后"，不算收敛
@@ -666,6 +780,48 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     indirect = sum(1 for _, (_, rr, _, _) in filled.items() if rr > 1)
     ambiguous = len(tie_cells)                  # 命中多行取值不同、最终仍留空待人工选
     n_blank = max(0, n_fill["miss"] - ambiguous)   # 纯"源表没有"的留空（护栏：不得为负）
+
+    # ---- 候选表（供页面一键确认 → 写进经验库，下次自动填）----
+    _ch_cols = ["行号", "列名", "类型", "钥匙值", "候选1", "候选2", "候选3", "备注"]
+    choices = []
+    for (i, tcol), (tn, k_used, how, cand_vals, sname) in tie_cells.items():
+        cand_vals = list(cand_vals) + [""] * (3 - len(cand_vals))
+        choices.append({"行号": i + 2, "列名": tcol, "类型": "多候选",
+                        "钥匙值": _row_key_text(template_df, i, key_pairs),
+                        "候选1": cand_vals[0], "候选2": cand_vals[1], "候选3": cand_vals[2],
+                        "备注": f"{sname} 同键 {tn} 行取值不同"})
+    for i in template_df.index:                 # 未补上 → 给最接近的 3 个候选
+        for tcol in target_cols:
+            if (i, tcol) in tie_cells:
+                continue
+            if _has_value(result.at[i, tcol]) or _has_value(template_df.at[i, tcol]):
+                continue
+            row_vals = {}
+            for c in exp_cols:
+                v = template_df.at[i, c]
+                if _has_value(v):
+                    row_vals[c] = norm_text(v)
+            near = []
+            for si, s in enumerate(sources):
+                pairs = [(tk, scol, cs) for tk, scol, cs in key_pairs[si]]
+                for cand in (supply.get(tcol) or []):
+                    if cand["source"] != si:
+                        continue
+                    nv = _near_values(s, pairs, row_vals, cand["col"])
+                    if nv:
+                        near = [(sc, v, s["name"]) for sc, v in nv]
+                        break
+                if near:
+                    break
+            if near:
+                vals = [v for _sc, v, _nm in near] + [""] * (3 - len(near))
+                choices.append({"行号": i + 2, "列名": tcol, "类型": "最接近候选",
+                                "钥匙值": _row_key_text(template_df, i, key_pairs),
+                                "候选1": vals[0], "候选2": vals[1], "候选3": vals[2],
+                                "备注": "；".join(f"{v}≈{sc:.0f}%" for sc, v, _nm in near)
+                                + f"（来源：{near[0][2]}）"})
+    choices_df = pd.DataFrame(choices, columns=_ch_cols) if choices \
+        else pd.DataFrame(columns=_ch_cols)
 
     # ---- 复验：只用"同一语义的降级对照"（少用一把 / 退到单钥匙），不抽无关列 ----
     audit = {"组数": 0, "可比格": 0, "不一致": []}
@@ -717,7 +873,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     # 「复验不一致」本质是"少一把钥匙→配到别的行"的预期差异，对用户没有可执行动作 →
     # 不进主清单，只留质量分 + 明细（audit_detail，页面折叠/导出第三个 Sheet）
     review = []
-    for (i, tcol), (tn, k_used, _how) in tie_cells.items():
+    for (i, tcol), (tn, k_used, _how, _cv, _sn) in tie_cells.items():
         review.append({"类型": f"多候选(已留空,{tn}行取值不同)", "行号": i + 2, "列名": tcol,
                        "钥匙值": _row_key_text(template_df, i, key_pairs), "主结果": ""})
     for i in template_df.index:
@@ -738,6 +894,19 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     audit_df = pd.DataFrame(audit["不一致"], columns=_aud_cols) if audit["不一致"] \
         else pd.DataFrame(columns=_aud_cols)
 
+    # ---- 抽查清单：所有**非 100%** 的填充格（模糊/多钥匙/级联 → 都要让人能看到）----
+    _pt_cols = ["行号", "列名", "值", "置信", "钥匙值"]
+    partial = []
+    for (i, tcol), (sc0, _rr, _k, _t) in filled.items():
+        if _band(sc0) == "ok":
+            continue
+        partial.append({"行号": i + 2, "列名": tcol, "值": result.at[i, tcol],
+                        "置信": conf.at[i, tcol],
+                        "钥匙值": _row_key_text(template_df, i, key_pairs)})
+    partial.sort(key=lambda r: (r["行号"], str(r["列名"])))
+    partial_df = pd.DataFrame(partial, columns=_pt_cols) if partial \
+        else pd.DataFrame(columns=_pt_cols)
+
     # 每张源表实际用了哪几把钥匙（给界面显示）
     key_used_desc = [(sources[si]["name"],
                       "、".join(str(tk) for tk, _c, _s in key_pairs[si]) or "—")
@@ -751,6 +920,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
              "级联轮数": rounds_used, "间接补全格数": indirect, "歧义格数": ambiguous,
              "留空合计": n_fill["miss"],
              "延后源表数": len(deferred_sources),
+            "经验库命中": n_exp,
+            "非100%格数": n_fill["high"] + n_fill["mid"] + n_fill["low"],
              "复验组数": audit["组数"], "复验可比格": n_cmp, "复验不一致格": n_diff,
              "复验一致率": round(consistency * 100, 1),
              "需人工确认行数": len(review_df),
@@ -758,7 +929,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
              "未补全行数": int((conf[target_cols] == "miss").any(axis=1).sum()) if target_cols else 0}
     return {"result": result, "confidence": conf, "stats": stats,
             "supply": supply, "legend": legend_lines(stats), "key_pairs": key_pairs,
-            "review": review_df, "audit": audit_df}
+            "review": review_df, "audit": audit_df, "choices": choices_df,
+            "partial": partial_df, "exp_key_cols": exp_cols}
 
 
 def _row_key_text(template_df, i, key_pairs):

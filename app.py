@@ -42,7 +42,8 @@ from core.templater import fill_template
 from core.registry import list_skills
 from core.table_filler import COLORS as FILL_COLORS, export_filled, fill_multi
 from core.theme import beautify_bytes, beautify_file_in_place
-from ui_components import browse_file_path, file_key, pick_columns, pick_header_row
+from ui_components import (browse_file_path, browse_file_paths, file_key, pick_columns,
+                           pick_header_row)
 
 st.set_page_config(page_title="AI 采购助理", page_icon="🧰", layout="wide")
 st.title("🧰 AI 采购助理")
@@ -66,7 +67,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.03"
+BUILD = "2026-09-15.04"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -656,6 +657,15 @@ elif mode in ("仅对齐", "完整比价"):
                                 accept_multiple_files=True, key="cmp_up")
         _uploads = [(u.name, u.getvalue()) for u in (_ups or [])]
     else:
+        _browsed = browse_file_paths("cmp_browse")
+        _cur_txt = st.session_state.get("cmp_paths", "") or ""
+        if _browsed:
+            _lines = [x.strip() for x in _cur_txt.splitlines() if x.strip()]
+            for _b in _browsed:
+                if _b and _b not in _lines:
+                    _lines.append(_b)
+            st.session_state["cmp_paths"] = "\n".join(_lines)
+            _cur_txt = st.session_state["cmp_paths"]
         _txt = st.text_area("每行一个完整文件路径", height=120, key="cmp_paths",
                             placeholder=r"例如 C:\Users\zq130\Desktop\工作台\9.10\001.xlsx")
         for _line in (_txt or "").splitlines():
@@ -908,18 +918,35 @@ elif mode == "多表补全":
                        + f"待补列：{'、'.join(str(c) for c in _tpl_df.columns if c not in _tkeys)}")
 
     st.subheader("② 源表（可多张）")
-    _src_kind = st.radio("源表来源", ["上传文件（可多选）", "从项目 raw_quotes 目录选"],
+    _src_kind = st.radio("源表来源", ["上传文件（可多选）", "从项目 raw_quotes 目录选", "粘贴文件路径"],
                          horizontal=True, key="mf_srckind")
     _src_files = []      # [(name, bytes_or_path, is_path)]
     if _src_kind.startswith("上传"):
         _ups2 = st.file_uploader("上传源表（xlsx/xls/csv，可多选）", type=UP_TYPES,
                                  accept_multiple_files=True, key="mf_up")
         _src_files = [(u.name, u.getvalue(), False) for u in (_ups2 or [])]
-    else:
+    elif _src_kind.startswith("从项目"):
         _files2 = sorted(f for f in os.listdir(_RAW_DIR2)
                          if f.lower().endswith((".xlsx", ".xlsm", ".xls", ".csv"))) if os.path.isdir(_RAW_DIR2) else []
         _pick2 = st.multiselect("选择源表文件（可多选）", _files2, default=_files2, key="mf_pick")
         _src_files = [(f, os.path.join(_RAW_DIR2, f), True) for f in _pick2]
+    else:
+        _browsed2 = browse_file_paths("mf_browse")
+        _cur2 = st.session_state.get("mf_paths", "") or ""
+        if _browsed2:
+            _l2 = [x.strip() for x in _cur2.splitlines() if x.strip()]
+            for _b2 in _browsed2:
+                if _b2 and _b2 not in _l2:
+                    _l2.append(_b2)
+            st.session_state["mf_paths"] = "\n".join(_l2)
+        _txt2 = st.text_area("每行一个完整文件路径（源表）", height=110, key="mf_paths",
+                             placeholder=r"例如 C:\Users\zq130\Desktop\工作台\9.10\合约规划明细表.xlsx")
+        for _line2 in (_txt2 or "").splitlines():
+            _p2 = _line2.strip().strip('"').strip("'")
+            if _p2 and os.path.exists(_p2):
+                _src_files.append((os.path.basename(_p2), _p2, True))
+            elif _p2:
+                st.error(f"路径不存在：{_p2}")
 
     _sources = []
     for _i, (_nm, _data, _is_path) in enumerate(_src_files):
@@ -992,7 +1019,8 @@ elif mode == "多表补全":
                                        key_min=float(_kmin2), max_rounds=int(_rnd2),
                                        promote_min=float(_pmin2), auto_keys=bool(_autok2),
                                        defer_single=bool(_def2), audit_rounds=int(_aud2),
-                                       audit_seed=int(_seed2), allow_domain=bool(_dom2))
+                                       audit_seed=int(_seed2), allow_domain=bool(_dom2),
+                                       experience=store)
                 st.session_state["mf_res"] = _res2
             except Exception as e:
                 log_exception("多表补全失败", e)
@@ -1005,19 +1033,75 @@ elif mode == "多表补全":
             _nd = _st2.get("需人工确认行数", 0)
             _rv = _mfres["review"]
             _ad = _mfres.get("audit")
+            _pt = _mfres.get("partial")
+            _ch = _mfres.get("choices")
             _amb = _st2.get("歧义格数", 0)
+            _nexp = _st2.get("经验库命中", 0)
+            _n100 = _st2.get("非100%格数", 0)
+            _nmiss = _st2.get("未匹配(留空)", 0)
             st.markdown(
-                f"**结论**：{_st2['模板行数']} 行 → 补上 {_st2['完全匹配(100%)'] + _st2['高置信(80-99%)']} 格"
-                f"（完全匹配 {_st2['完全匹配(100%)']}、高置信 {_st2['高置信(80-99%)']}）；"
-                f"留空 {_st2.get('留空合计', _st2['未匹配(留空)'])} 格"
-                + (f"（其中 **{_amb} 格命中多行、取值不同 → 没猜，等你选一条**）" if _amb else "")
-                + f"；复验一致率 {_st2.get('复验一致率', 100)}% → **需人工看 {_nd} 行**")
-            with st.expander("看细节（分档 / 用了哪几把钥匙 / 复验存疑 / 图例）"):
+                f"**结论**：{_st2['模板行数']} 行 × {_st2['目标列数']} 列 → "
+                f"**100% 精确 {_st2['完全匹配(100%)']} 格**"
+                + (f"（含经验库命中 {_nexp}）" if _nexp else "")
+                + (f"｜**非 100% {_n100} 格**（浅黄/浅蓝/浅紫，已在下方抽查区列出）" if _n100 else "｜无非100%格")
+                + f"｜留空 {_st2.get('留空合计', 0)}（待你选 {_amb}／源表缺 {_nmiss}）"
+                + f"｜复验一致率 {_st2.get('复验一致率', 100)}% → **需人工看 {_nd} 行**")
+            st.dataframe(_mfres["result"], height=420, width="stretch")
+
+            # ---- 需人工确认：一行一选 → 写进经验库（下次自动填）----
+            if len(_rv):
+                st.markdown(f"**① 需人工确认 {len(_rv)} 行**（多候选留空 / 未补上）"
+                            "——选定后点「确认并记住」，**下次同样的行会自动填、不再问你**")
+                st.dataframe(_rv, height=200, width="stretch")
+                _ch_map = {}
+                if _ch is not None and len(_ch):
+                    for _, _c in _ch.iterrows():
+                        _ch_map[(_c["行号"], str(_c["列名"]))] = _c
+                _tgt_cols = [c for c in _mfres["result"].columns
+                             if c not in _tkeys]
+                for _k2, _r2 in _rv.iterrows():
+                    _row_no, _col = int(_r2["行号"]), str(_r2["列名"])
+                    _cand = _ch_map.get((_row_no, _col))
+                    _opts = []
+                    if _cand is not None:
+                        _opts = [str(_cand.get(f"候选{i}", "")) for i in (1, 2, 3)]
+                        _opts = [o for o in _opts if o.strip()]
+                    _cc1, _cc2 = st.columns([3, 1])
+                    with _cc1:
+                        _hint = f"（{_cand['类型']}；{_cand['备注']}）" if _cand is not None else "（源表里没有这条键）"
+                        _pick_val = st.selectbox(
+                            f"行 {_row_no} · {_col} · {_r2['钥匙值']} {_hint}",
+                            (["（不选）"] + _opts) if _opts else ["（无候选可给）"],
+                            key=file_key("mfch", _row_no, _col, _st2.get("模板行数")))
+                    with _cc2:
+                        st.write("")
+                        if _opts and st.button("✅ 确认并记住", key=file_key("mfrec", _row_no, _col)):
+                            if _pick_val and not _pick_val.startswith("（"):
+                                try:
+                                    from core.table_filler import exp_key_for
+                                    _kk = exp_key_for(_tpl_df, _row_no - 2, _col,
+                                                      _mfres.get("exp_key_cols") or [])
+                                    store.record([_kk], [_pick_val], src="多表补全", raw=True)
+                                    st.toast(f"已记住：{_col} ← {_pick_val}（重跑即生效）")
+                                except Exception as _e2:
+                                    st.error(f"写入经验库失败：{_e2}")
+
+            # ---- 抽查区：非 100% 的格 + 复验明细（默认展开，别让非100%藏起来）----
+            if (_pt is not None and len(_pt)) or (_ad is not None and len(_ad)):
+                with st.expander("② 抽查区（非 100% 的格 + 复验明细）", expanded=True):
+                    if _pt is not None and len(_pt):
+                        st.caption(f"非 100% 的 {len(_pt)} 格：模糊匹配/多把钥匙补出来的，建议抽查")
+                        st.dataframe(_pt, height=200, width="stretch")
+                    if _ad is not None and len(_ad):
+                        st.caption(f"复验存疑 {len(_ad)} 格（= 少用一把钥匙后结果会变，属预期；"
+                                   f"导出件里有「复验存疑」Sheet）")
+                        st.dataframe(_ad, height=200, width="stretch")
+            with st.expander("③ 细节（分档 / 用了哪几把钥匙 / 图例）"):
                 st.caption(f"高置信 {_st2['高置信(80-99%)']}｜中置信 {_st2['中置信(40-80%)']}｜"
                            f"低置信 {_st2['低置信(20-40%)']}｜有未补全格的行 {_st2['未补全行数']}｜"
                            f"级联轮数 {_st2.get('级联轮数', 1)}｜间接补全 {_st2.get('间接补全格数', 0)}｜"
                            f"多候选(已留空) {_amb}｜延后源表 {_st2.get('延后源表数', 0)}｜"
-                           f"复验可比 {_st2.get('复验可比格', 0)} 格")
+                           f"经验库命中 {_nexp}｜复验可比 {_st2.get('复验可比格', 0)} 格")
                 for _nm2, _kd2 in _st2.get("实际钥匙列", []):
                     st.caption(f"🔑 {_nm2}：{_kd2}")
                 for _nt2 in _st2.get("钥匙说明", []):
@@ -1025,14 +1109,6 @@ elif mode == "多表补全":
                 st.caption("颜色图例：" + "；".join([
                     "无色=完全匹配(100%)或模板原有值", "浅黄=高置信(80–99%)", "浅蓝=中置信(40–80%)",
                     "浅紫=低置信(20–40%)", "浅灰底空格=未匹配（留空）"]))
-                if _ad is not None and len(_ad):
-                    st.caption(f"复验存疑明细 {len(_ad)} 格（本质是「少一把钥匙→配到别的行」的预期差异，"
-                               f"一般不用看；已在下载件的「复验存疑」Sheet）")
-                    st.dataframe(_ad, height=200, width="stretch")
-            st.dataframe(_mfres["result"], height=420, width="stretch")
-            if len(_mfres["review"]):
-                st.markdown(f"**需人工确认 {len(_mfres['review'])} 行**（多候选留空 / 未补上）")
-                st.dataframe(_mfres["review"], height=220, width="stretch")
             try:
                 os.makedirs(_OUT_DIR2, exist_ok=True)
                 _fn2 = f"多表补全_{_dt.now():%Y%m%d_%H%M%S}.xlsx"

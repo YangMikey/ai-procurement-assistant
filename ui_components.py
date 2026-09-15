@@ -132,3 +132,56 @@ def browse_file_path(key):
         except Exception as e:
             st.error(f"打开文件选择框失败：{e}")
     return st.session_state.get(f"{key}_value", "")
+
+
+def _ask_paths(key, code_files, label):
+    """通用：弹 tkinter 原生选择框，把结果路径列表存进 session_state（{key}_list）。"""
+    code = ("import tkinter as tk, tkinter.filedialog, json\n"
+            "r = tk.Tk()\n"
+            "r.attributes('-topmost', True)\n"
+            "r.withdraw()\n"
+            "r.focus_force()\n"
+            f"p = {code_files}\n"
+            "r.destroy()\n"
+            "print(json.dumps(p))\n")
+    try:
+        with st.spinner("已弹出文件选择窗口（若被遮挡请看任务栏）…"):
+            out = subprocess.run([sys.executable, "-c", code],
+                                 capture_output=True, text=True, timeout=600)
+        picked = []
+        for line in (out.stdout or "").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    val = json.loads(line)
+                except json.JSONDecodeError:
+                    val = None
+                if isinstance(val, str) and val:
+                    picked = [val]
+                elif isinstance(val, (list, tuple)):
+                    picked = [str(x) for x in val if str(x).strip()]
+                break
+        if picked:
+            st.session_state[f"{key}_list"] = picked
+            st.toast(f"已选择 {len(picked)} 个文件")
+        else:
+            st.info("未选择文件")
+    except Exception as e:
+        st.error(f"打开文件选择框失败：{e}")
+    return list(st.session_state.get(f"{key}_list", []))
+
+
+def browse_file_paths(key, label="📂 浏览选择文件（可多选）"):
+    """「浏览选择文件」按钮（**多选**）：一次可挑多份 Excel/CSV。
+
+    返回本次累计已选路径列表（存在 session_state：{key}_list）。
+    调用方一般把它追加进文本框/列表，再自行去重。
+    """
+    if st.button(label, key=key):
+        return _ask_paths(
+            key,
+            "tkinter.filedialog.askopenfilenames(\n"
+            "    title='选择 Excel/CSV 文件（可多选，Ctrl/Shift 多选）',\n"
+            "    filetypes=[('Excel/CSV', '*.xlsx *.xlsm *.xls *.csv'), ('所有文件', '*.*')])",
+            label)
+    return list(st.session_state.get(f"{key}_list", []))
