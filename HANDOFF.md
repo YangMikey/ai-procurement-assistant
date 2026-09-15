@@ -39,6 +39,8 @@
 
 **新增（都在 gitignore 的 `logs/` 下）**：`logs/startup.log`（每次冷启动一行 `browser opened (ready) N s after launcher start`）、`logs/launch_marker.txt`（bat 每次启动写的时间基准）。
 
+**注意（2026-09-15 收尾）**：用户要求清掉测试产物 → `data/outputs/` 已清空、`logs/startup.log` 已清空（下次启动自动重建）、`__pycache__` 已清。要复现报告就重跑对应测试（`tests/experiment_*.py` 会自动写出 `data/outputs/*.txt`）；"多表补全真实回测"的样例 xlsx 需按回测测试里的方式手动导出。
+
 ## 上一版（2026-09-15·宁缺勿错 + 复验收敛 + 清单分级）
 
 **用户原则（2026-09-15 明确）**：*"你每次给建议自己测试过后才有话语权，不然加了一堆没用的，有用的反而被掩盖了"* —— 任何建议先跑数据验证，再决定做不做。
