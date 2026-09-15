@@ -2,6 +2,7 @@
 """预览式选择组件：表头行点选 + 列点选 + 浏览文件弹窗（仅换算 / 两表匹配两页共用）。"""
 import io
 import json
+import os
 import subprocess
 import sys
 
@@ -185,3 +186,71 @@ def browse_file_paths(key, label="📂 浏览选择文件（可多选）"):
             "    filetypes=[('Excel/CSV', '*.xlsx *.xlsm *.xls *.csv'), ('所有文件', '*.*')])",
             label)
     return list(st.session_state.get(f"{key}_list", []))
+
+
+def browse_dir(key, label="📂 选择文件夹"):
+    """弹原生「选择文件夹」对话框，选中后写入 session_state（{key}_dir）。返回该目录（可能为空）。"""
+    if st.button(label, key=key):
+        code = ("import tkinter as tk, tkinter.filedialog, json\n"
+                "r = tk.Tk()\n"
+                "r.attributes('-topmost', True)\n"
+                "r.withdraw()\n"
+                "r.focus_force()\n"
+                "p = tkinter.filedialog.askdirectory(title='选择保存文件夹')\n"
+                "r.destroy()\n"
+                "print(json.dumps(p))\n")
+        try:
+            with st.spinner("已弹出文件夹选择窗口（若被遮挡请看任务栏）…"):
+                out = subprocess.run([sys.executable, "-c", code],
+                                     capture_output=True, text=True, timeout=600)
+            path = ""
+            for line in (out.stdout or "").splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        path = json.loads(line)
+                    except json.JSONDecodeError:
+                        path = ""
+                    break
+            if path:
+                st.session_state[f"{key}_dir"] = path
+                st.toast(f"已选文件夹：{path}")
+        except Exception as e:
+            st.error(f"打开文件夹选择框失败：{e}")
+    return st.session_state.get(f"{key}_dir", "")
+
+
+def save_to_folder(file_bytes, file_name, sid, help_text=None):
+    """结果「另存到指定文件夹」：输入框 + 选择文件夹 + 一键另存。
+
+    与"下载"互补：下载走浏览器，这里直接写到本机指定目录（默认建议桌面）。
+    """
+    _home = os.path.expanduser("~")
+    _desk = os.path.join(_home, "Desktop")
+    _default = st.session_state.get(f"savedir_{sid}") or (_desk if os.path.isdir(_desk) else _home)
+    c1, c2, c3 = st.columns([3, 1, 1])
+    with c1:
+        _dir = st.text_input("另存到文件夹（可直接粘贴完整路径）", value=_default,
+                             key=f"savedir_{sid}", help=help_text)
+    with c2:
+        st.write("")
+        _picked = browse_dir(f"browse_dir_{sid}")
+        if _picked:
+            st.session_state[f"savedir_{sid}"] = _picked
+            _dir = _picked
+    with c3:
+        st.write("")
+        if st.button("💾 另存到该文件夹", key=f"savebtn_{sid}"):
+            try:
+                _d = str(_dir or "").strip().strip('"').strip("'")
+                if not _d:
+                    st.warning("请先填/选一个文件夹")
+                elif not os.path.isdir(_d):
+                    st.error(f"文件夹不存在：{_d}")
+                else:
+                    _out = os.path.join(_d, file_name)
+                    with open(_out, "wb") as _fh:
+                        _fh.write(file_bytes)
+                    st.success(f"已另存：{_out}")
+            except Exception as e:
+                st.error(f"另存失败：{e}")

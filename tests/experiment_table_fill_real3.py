@@ -108,6 +108,9 @@ else:
     check("清单只含「多候选 / 未补上」两类（复验明细另存）",
           set(rv["类型"].astype(str).map(lambda s: s.split("(")[0])) <= {"多候选", "未补上"}
           and "复验不一致" not in set(rv["类型"]))
+    check("两源交叉核对：有可比格，且矛盾格数 ≤ 可比格（合同编号两源都供）",
+          st["两源可核对格"] > 0 and 0 <= st["两源矛盾格"] <= st["两源可核对格"])
+    check("复验默认关（需显式开才跑）", st["复验组数"] == 0)
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     lines = ["多表补全 · 真实三文件回归",

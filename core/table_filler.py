@@ -42,7 +42,8 @@ SYNONYM_GROUPS = [
     ("终止", "失效", "作废"),
     ("金额", "总价", "总金额", "合价"),
     ("单价", "价格", "报价", "价"),
-    ("编号", "编码", "单号", "号码"),
+    ("编号", "单号", "号码"),              # 合同编号/单号 —— 与"编码"分开（合同编号 ≠ 项目编码）
+    ("编码", "代码", "科目"),
     ("名称", "品名", "名称规格", "品名规格"),
     ("供应商", "厂商", "厂家", "供货商", "乙方"),
     ("单位", "计量单位"),
@@ -143,6 +144,48 @@ def _name_looks_date(name):
     return any(k in n for k in _DATE_NAME_KWS)
 
 
+# 编号/编码口径的列名特征 & 取值特征（软守卫：不像编号的列只降分、不硬拦）
+_CODE_NAME_KWS = ("编号", "单号", "号码", "编码", "代码")
+
+
+def _name_looks_code(name):
+    n = norm_col(name)
+    return any(k in n for k in _CODE_NAME_KWS)
+
+
+def _looks_code_col(series, min_vals=5, need=0.6):
+    """源列取值是否"像编号"：含数字、且多数带连字符/下划线或足够长。返回 (像不像, 比例)。
+
+    值太少（<min_vals）时不敢判 → 放行（保持旧行为）。
+    """
+    try:
+        it = series.tolist()
+    except Exception:
+        it = list(series)
+    vals = [v for v in it if _has_value(v)]
+    if len(vals) < min_vals:
+        return True, 1.0
+    good = 0
+    for v in vals:
+        s = str(v).strip()
+        has_digit = any(ch.isdigit() for ch in s)
+        if has_digit and (("-" in s) or ("_" in s) or len(s) >= 10):
+            good += 1
+    frac = good / len(vals)
+    return frac >= need, frac
+
+
+def _code_guard_block(tpl_col, how, series):
+    """编号类目标列的**硬守卫**：非「同名」来源、且取值不像编号 → 不采用该列。
+
+    典型：`合同编号` 的正确列这行为空时，别让 `甲方编号`(YC01)/`项目编码` 顶上来。
+    「同名」列不受限（各家编号风格不同，同名列永远可信）。
+    """
+    if how == "同名" or not _name_looks_code(tpl_col):
+        return False
+    return not _looks_code_col(series)[0]
+
+
 def _looks_date_col(series, min_vals=5, need=0.5):
     """源列取值是否"像日期/月份"：返回 (是否达标, 像日期的比例)。
 
@@ -192,8 +235,8 @@ def pair_col(tpl_col, src_col, tpl_series=None, src_series=None,
              threshold=COL_DEFAULT_THRESHOLD, allow_domain=True):
     """列配对：先列名（同名/同义/近似）→ 不达标再试**值域指纹**（方式标「值域」）。
 
-    类型守卫：目标列名是**日期/月份口径**时，源列取值必须"像日期/月份"，
-    否则判冲突 —— 防「合同到期月份 ← 终止状态（未终止）」这类误配。
+    类型守卫：目标列名是**日期/月份口径**时，源列取值必须"像日期/月份"，否则判冲突；
+    目标列名是**编号口径**时，不像编号的源列只**降 15 分**（软守卫，避免误伤风格不同的编号）。
     """
     sc, how = col_match(tpl_col, src_col, threshold)
     if sc < threshold and how != "冲突" and _name_looks_date(tpl_col) and src_series is not None:
@@ -201,6 +244,8 @@ def pair_col(tpl_col, src_col, tpl_series=None, src_series=None,
         if not ok:
             return 0.0, "冲突"
     if sc >= threshold:
+        if _name_looks_code(tpl_col) and src_series is not None and _looks_code_col(src_series)[0] is False:
+            sc = max(0.0, sc - 15.0)       # 软守卫：不像编号的列只降分（让真正的编号列排前面）
         return sc, how
     if how == "冲突":                      # 含税/级别这类语义冲突：不给兜底
         return 0.0, how
@@ -233,6 +278,7 @@ def _key_sim(a, b):
 
 
 PROMOTE_MIN = 80.0        # 补出的值置信 ≥ 此分才允许"升级为钥匙"（级联用）
+TIE_STOP_MIN = 80.0       # 钥匙命中多行时：≥此分视为"真歧义"（留空、不回退）；<此分当没命中
 MAX_ROUNDS = 4            # 级联最大轮数（提前收敛：某轮无新增即停）
 EXP_NS = "多表补全"        # 经验库命名空间（与两表匹配的键区分开）
 
@@ -458,7 +504,8 @@ def _pick_row(rows, df, target_col, score, k, exact, blank_on_tie=False):
 
     - 取值相同 → 直接用第 1 条（不算歧义）
     - 取值不同 → tie_n>0；blank_on_tie=True 时返回 row=None（**留空交给人工，不猜**）
-    返回 (row_or_None, score, k, tie_n, exact, rows)：rows 供页面给候选值。
+    返回 (row_or_None, **原始匹配分**, k, tie_n, exact, rows)：rows 供页面给候选值。
+    注意：分档降级（歧义→≤39）由调用处决定，这里保留原始分，便于判断"歧义质量"。
     """
     if len(rows) == 1:
         return rows[0], score, k, 0, exact, rows
@@ -467,7 +514,7 @@ def _pick_row(rows, df, target_col, score, k, exact, blank_on_tie=False):
     same = all((pd.isna(a) and pd.isna(first)) or (a == first) for a in vals)
     if same:
         return rows[0], score, k, 0, exact, rows
-    return (None if blank_on_tie else rows[0]), min(score, 39.0), k, len(rows), exact, rows
+    return (None if blank_on_tie else rows[0]), score, k, len(rows), exact, rows
 
 
 def _near_values(src, pairs, row_vals, target_col, lo=40.0, topn=3):
@@ -565,7 +612,7 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on
 def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                col_threshold=COL_DEFAULT_THRESHOLD, key_min=KEY_MIN,
                key_cols=None, max_rounds=MAX_ROUNDS, promote_min=PROMOTE_MIN,
-               auto_keys=True, defer_single=True, audit_rounds=2, audit_seed=42,
+               auto_keys=True, defer_single=True, audit_rounds=0, audit_seed=42,
                allow_domain=True, key_plan=None, _audit=False, max_keys=4,
                blank_on_tie=True, experience=None):
     """多源 → 模板 单向填充（自动配钥匙 + 分层钥匙 + 级联 + 复验）。
@@ -702,39 +749,45 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                         continue
                 best = None
                 tie_info = None
-                for si in active:
+                # 候选列按**列名匹配度**降序（列名更对的先用）；该列这行取不到值/无命中才回退下一列。
+                # 若首选列命中多行且取值不同 → 不猜、**也不回退**（否则会被"值恰好唯一的错列"顶上来）
+                for cand in sorted(list(supply.get(tcol) or []), key=lambda c: -c["score"]):
+                    si = cand["source"]
+                    if si not in active:
+                        continue
                     s = sources[si]
+                    ccol = cand["col"]
+                    if ccol not in s["df"].columns:
+                        continue
                     # 匹配用钥匙：本行可得 & 不是"目标列自己"（防自引用）
                     pairs = [(tk, scol, cs) for tk, scol, cs in key_pairs[si]
                              if tk in row_vals and tk != tcol]
                     if not pairs:
                         continue
-                    for cand in (supply.get(tcol) or []):
-                        if cand["source"] != si:
-                            continue
-                        ccol = cand["col"]
-                        if ccol not in s["df"].columns:
-                            continue
-                        m = _match_source(s, pairs, row_vals, key_min, ccol, idx_cache,
-                                          blank_on_tie=blank_on_tie)
-                        if not m:
-                            continue
-                        j, sc, k_used, tie_n, exact, hit_rows = m
-                        if j is None:              # 命中多行且取值不同 → 不猜，记下来（带候选值）
-                            vals = [str(s["df"][ccol].iloc[r]) for r in hit_rows
-                                    if _has_value(s["df"][ccol].iloc[r])]
-                            uniq = []
-                            for v in vals:
-                                if v not in uniq:
-                                    uniq.append(v)
-                            if tie_info is None or tie_n > tie_info[0]:
-                                tie_info = (tie_n, k_used, cand["how"], uniq[:3], s["name"])
-                            continue
-                        v = s["df"][ccol].iloc[j]
-                        if not _has_value(v):
-                            continue
-                        if best is None or sc > best[1]:
-                            best = (v, sc, k_used, tie_n, cand["how"], pairs)
+                    m = _match_source(s, pairs, row_vals, key_min, ccol, idx_cache,
+                                      blank_on_tie=blank_on_tie)
+                    if not m:
+                        continue
+                    j, sc, k_used, tie_n, exact, hit_rows = m
+                    if j is None:              # 这列命中多行且取值不同 → 记候选（按列名分高者优先），继续回退
+                        vals = [str(s["df"][ccol].iloc[r]) for r in hit_rows
+                                if _has_value(s["df"][ccol].iloc[r])]
+                        uniq = []
+                        for v in vals:
+                            if v not in uniq:
+                                uniq.append(v)
+                        if tie_info is None:
+                            tie_info = (tie_n, k_used, cand["how"], uniq[:3], s["name"])
+                        continue
+                    v = s["df"][ccol].iloc[j]
+                    if not _has_value(v):      # 这行该列为空 → 回退下一列
+                        continue
+                    if _code_guard_block(tcol, cand["how"], s["df"][ccol]):
+                        continue               # 编号类列不吃"不像编号"的列（如 甲方编号/项目编码）
+                    if tie_n and not blank_on_tie:
+                        sc = min(sc, 39.0)     # 旧行为：并列且取第 1 条 → 降档
+                    best = (v, sc, k_used, tie_n, cand["how"], pairs)
+                    break
                 if best:
                     v, sc, k_used, tie_n, how, pairs = best
                     used_tks = [tk for tk, _c, _s in pairs][:k_used]
@@ -869,6 +922,72 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     n_diff = len(audit["不一致"])
     consistency = (1.0 - n_diff / n_cmp) if n_cmp else 1.0
 
+    # ---- 多源交叉核对（**独立复核**：两张源表都能供同一列时，比对两源给的值）----
+    # 两源都有值且不同 = 矛盾。**按列自校准**：某列矛盾率 >50% → 判为"同名不同口径"，
+    # 只给一行提示、不逐格列（否则 100+ 行会把人工清单淹掉）；≤50% 才逐格列。
+    cross = {"可比格": 0, "矛盾": [], "口径不同": []}
+    _multi_cols = [c for c in target_cols
+                   if len({cd["source"] for cd in (supply.get(c) or [])}) >= 2]
+    if _multi_cols:
+        final_avail = {}
+        for i in template_df.index:
+            rv = {}
+            for kc in key_candidates:
+                if kc in result.columns and _has_value(result.at[i, kc]):
+                    sc0 = 100.0 if (i, kc) not in filled else filled[(i, kc)][0]
+                    if sc0 >= promote_min:
+                        rv[kc] = norm_text(result.at[i, kc])
+            final_avail[i] = rv
+        for tcol in _multi_cols:
+            best_col_of = {}
+            for cd in sorted(list(supply.get(tcol) or []), key=lambda c: -c["score"]):
+                best_col_of.setdefault(cd["source"], cd["col"])
+            cmp_n = 0
+            bad = []
+            for i in template_df.index:
+                if not final_avail.get(i):
+                    continue
+                got = {}
+                for si, ccol in best_col_of.items():
+                    s = sources[si]
+                    if ccol not in s["df"].columns:
+                        continue
+                    pairs = [(tk, scol, cs) for tk, scol, cs in key_pairs[si]
+                             if tk in final_avail[i] and tk != tcol]
+                    if not pairs:
+                        continue
+                    m = _match_source(s, pairs, final_avail[i], key_min, ccol, idx_cache)
+                    if not m or m[0] is None or not m[4]:
+                        continue          # 只在"钥匙精确命中"时才做两源比对（否则是拿苹果比橘子）
+                    v = s["df"][ccol].iloc[m[0]]
+                    if _has_value(v):
+                        got[si] = v
+                if len(got) >= 2:
+                    cmp_n += 1
+                    items = list(got.items())
+                    if any(norm_text(items[0][1]) != norm_text(v) for _si, v in items[1:]):
+                        bad.append({"行号": i + 2, "列名": tcol,
+                                    "钥匙值": _row_key_text(template_df, i, key_pairs),
+                                    "源A（值）": f"{sources[items[0][0]]['name']}：{items[0][1]}",
+                                    "源B（值）": "；".join(f"{sources[si]['name']}：{v}"
+                                                          for si, v in items[1:])})
+            cross["可比格"] += cmp_n
+            if cmp_n >= 10 and len(bad) / cmp_n > 0.3:
+                # 大面积不一致 → 疑似"同名不同口径"，只提示、不逐格
+                _ex = bad[0]
+                cross["口径不同"].append(
+                    f"「{tcol}」：{len(bad)}/{cmp_n} 格两源不一致 → 疑似两张表**口径不同**"
+                    f"（例：{_ex['源A（值）']} vs {_ex['源B（值）']}）；已按列名匹配度取一家，"
+                    f"你若确认口径，可在源表里改列名区分")
+            else:
+                cross["矛盾"].extend(bad)
+    _cross_cols = ["行号", "列名", "钥匙值", "源A（值）", "源B（值）"]
+    cross_df = pd.DataFrame(cross["矛盾"], columns=_cross_cols) if cross["矛盾"] \
+        else pd.DataFrame(columns=_cross_cols)
+    n_cross_cmp = cross["可比格"]
+    n_cross_bad = len(cross["矛盾"])
+    cross_rate = (1.0 - n_cross_bad / n_cross_cmp) if n_cross_cmp else 1.0
+
     # ---- 需人工确认清单：只收「必看」（多候选留空 / 未补上）----
     # 「复验不一致」本质是"少一把钥匙→配到别的行"的预期差异，对用户没有可执行动作 →
     # 不进主清单，只留质量分 + 明细（audit_detail，页面折叠/导出第三个 Sheet）
@@ -924,13 +1043,16 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
             "非100%格数": n_fill["high"] + n_fill["mid"] + n_fill["low"],
              "复验组数": audit["组数"], "复验可比格": n_cmp, "复验不一致格": n_diff,
              "复验一致率": round(consistency * 100, 1),
+             "两源可核对格": n_cross_cmp, "两源矛盾格": n_cross_bad,
+             "两源一致率": round(cross_rate * 100, 1),
+             "两源口径不同列": list(cross.get("口径不同") or []),
              "需人工确认行数": len(review_df),
              "实际钥匙列": key_used_desc, "钥匙说明": plan["notes"],
              "未补全行数": int((conf[target_cols] == "miss").any(axis=1).sum()) if target_cols else 0}
     return {"result": result, "confidence": conf, "stats": stats,
             "supply": supply, "legend": legend_lines(stats), "key_pairs": key_pairs,
             "review": review_df, "audit": audit_df, "choices": choices_df,
-            "partial": partial_df, "exp_key_cols": exp_cols}
+            "partial": partial_df, "cross": cross_df, "exp_key_cols": exp_cols}
 
 
 def _row_key_text(template_df, i, key_pairs):
@@ -1011,17 +1133,22 @@ def legend_lines(stats):
     if stats.get("延后源表数"):
         extra.append(f"有 {stats['延后源表数']} 张源表第 1 轮延后（只有 1 把钥匙，等后续轮次凑第二把）")
     if stats.get("复验组数"):
-        extra.append(f"复验：另用「少一把钥匙」的降级对照跑了 {stats['复验组数']} 遍，"
+        extra.append(f"复验（仅开发回测）：另用「少一把钥匙」的对照跑了 {stats['复验组数']} 遍，"
                      f"可比 {stats.get('复验可比格', 0)} 格、一致率 {stats.get('复验一致率', 100)}%"
-                     f"（不一致 {stats.get('复验不一致格', 0)} 格属于「少钥匙→配到别的行」的预期差异，"
-                     f"明细在「复验存疑」Sheet，一般不用看）")
+                     f"（不一致 {stats.get('复验不一致格', 0)} 格属于「少钥匙→配到别的行」的预期差异）")
+    if stats.get("两源可核对格"):
+        extra.append(f"两源交叉核对：{stats['两源可核对格']} 格有两张源表都能供（都精确命中才比），"
+                     f"其中矛盾 {stats.get('两源矛盾格', 0)} 格（一致率 {stats.get('两源一致率', 100)}%）"
+                     + ("，见「两源矛盾」Sheet / 页面抽查区" if stats.get("两源矛盾格") else ""))
+    for _line in (stats.get("两源口径不同列") or []):
+        extra.append("两源" + _line)
     if stats.get("需人工确认行数"):
         extra.append(f"需人工确认：{stats['需人工确认行数']} 行（多候选留空 / 未补上，见第二个 Sheet）")
     return lines + extra
 
 
 def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, review_df=None,
-                  audit_df=None):
+                  audit_df=None, cross_df=None):
     """写出带颜色的整合表 + 下方备注块（表头/列宽/冻结/筛选/数字格式由 theme 统一处理）。"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -1061,6 +1188,13 @@ def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, re
                 ws2.append(["" if (v is None or (not isinstance(v, str) and pd.isna(v))) else v
                             for v in row])
             _style(ws2, 1, highlight_min=False)
+        if cross_df is not None and len(cross_df):
+            ws4 = wb.create_sheet("两源矛盾")
+            ws4.append([str(c) for c in cross_df.columns])
+            for _, row in cross_df.iterrows():
+                ws4.append(["" if (v is None or (not isinstance(v, str) and pd.isna(v))) else v
+                            for v in row])
+            _style(ws4, 1, highlight_min=False)
         if audit_df is not None and len(audit_df):
             ws3 = wb.create_sheet("复验存疑")
             ws3.append([str(c) for c in audit_df.columns])

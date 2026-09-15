@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """AI 采购助理 · 网页版（V1）
 
 任务模式：
@@ -43,7 +43,7 @@ from core.registry import list_skills
 from core.table_filler import COLORS as FILL_COLORS, export_filled, fill_multi
 from core.theme import beautify_bytes, beautify_file_in_place
 from ui_components import (browse_file_path, browse_file_paths, file_key, pick_columns,
-                           pick_header_row)
+                           pick_header_row, save_to_folder)
 
 st.set_page_config(page_title="AI 采购助理", page_icon="🧰", layout="wide")
 st.title("🧰 AI 采购助理")
@@ -67,7 +67,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.04"
+BUILD = "2026-09-15.05"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -520,6 +520,7 @@ if mode == "两表匹配补缺":
                     buf = export_df_bytes(res["result"], sheet_name="补缺结果")
                     st.download_button("⬇️ 下载结果 Excel", buf, file_name="匹配结果.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    save_to_folder(buf, f"匹配结果_{_dt.now():%Y%m%d_%H%M%S}.xlsx", "match")
                 except Exception as e:
                     log_exception("导出下载件失败", e)
                     st.error(f"生成下载件出错（已记日志）：{e}")
@@ -612,6 +613,7 @@ elif mode == "仅换算":
                 buf = export_df_bytes(out, sheet_name="换算结果")
                 st.download_button("⬇️ 下载换算结果", buf, file_name="换算结果.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                save_to_folder(buf, f"换算结果_{_dt.now():%Y%m%d_%H%M%S}.xlsx", "conv")
                 if can_writeback(src):
                     if st.button("✍️ 写回原文件（自动先建 ai副本）", type="primary", disabled=CORE_STALE):
                         try:
@@ -792,6 +794,7 @@ elif mode in ("仅对齐", "完整比价"):
                 st.download_button("⬇️ 下载对齐矩阵", _bytes, file_name=_fn,
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                    key="cmp_align_dl")
+                save_to_folder(_bytes, _fn, "align")
                 st.success(f"已导出到项目内：data\\outputs\\{_fn}")
             except Exception as e:
                 log_exception("对齐矩阵导出失败", e)
@@ -826,6 +829,7 @@ elif mode in ("仅对齐", "完整比价"):
                         st.download_button("⬇️ 下载比价表", _fh.read(), file_name=_fn,
                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                            key="cmp_dl")
+                        save_to_folder(open(_out, "rb").read(), _fn, "compare")
                     st.success(f"已导出到项目内：data\\outputs\\{_fn}")
                 except Exception as e:
                     log_exception("比价导出失败", e)
@@ -856,6 +860,7 @@ elif mode in ("仅对齐", "完整比价"):
                             st.download_button("⬇️ 下载模板输出", _bytes, file_name=_fn,
                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                                key="cmp_tpl_dl")
+                            save_to_folder(_bytes, _fn, "tplout")
                             st.success(f"已写入 {_info['sheet']} {_info['start']}~{_info['end']}"
                                        f"（{_info['rows']} 行 × {_info['cols']} 列）")
                         except Exception as e:
@@ -980,9 +985,11 @@ elif mode == "多表补全":
                                 help="两列取值高度重合就认成同一类列；小表（唯一值<5）不启用")
             _def2 = st.checkbox("只有 1 把钥匙的源表第 1 轮先延后", value=True, key="mf_defer",
                                 help="等后续轮次凑到第二把钥匙再两把一起用；始终只有 1 把就按 1 把匹配")
-            _aud2 = st.slider("复验：另换几组钥匙列再跑一遍（0=不复验）", 0, 3, 2, key="mf_audit",
-                              help="两次取值不一致的格会进「需人工确认」清单")
-            _seed2 = st.number_input("复验随机种子", 0, 99999, 42, key="mf_seed")
+            _aud2 = st.slider("复验：另用「少一把钥匙」的对照再跑几遍（0=不跑，默认关）", 0, 3, 0,
+                              key="mf_audit",
+                              help="实测：它只是「少一把钥匙 → 配到别的行」的预期差异，不是错值信号；"
+                                   "默认关，仅开发回测用")
+            _seed2 = st.number_input("复验随机种子（已弃用）", 0, 99999, 42, key="mf_seed")
         try:
             from core.table_filler import preview_keys as _pk
             _kp = _pk(_tkeys or list(_tpl_df.columns)[:1], _sources, float(_thr2),
@@ -1030,22 +1037,27 @@ elif mode == "多表补全":
         if _mfres:
             st.subheader("④ 结果（预览见下方；下载件带颜色与备注）")
             _st2 = _mfres["stats"]
-            _nd = _st2.get("需人工确认行数", 0)
             _rv = _mfres["review"]
+            _nd = _st2.get("需人工确认行数", 0)
+            _nd_rows = int(_rv["行号"].nunique()) if len(_rv) else 0
             _ad = _mfres.get("audit")
             _pt = _mfres.get("partial")
+            _cx = _mfres.get("cross")
             _ch = _mfres.get("choices")
             _amb = _st2.get("歧义格数", 0)
             _nexp = _st2.get("经验库命中", 0)
             _n100 = _st2.get("非100%格数", 0)
             _nmiss = _st2.get("未匹配(留空)", 0)
+            _ncmp = _st2.get("两源可核对格", 0)
+            _nbad = _st2.get("两源矛盾格", 0)
             st.markdown(
                 f"**结论**：{_st2['模板行数']} 行 × {_st2['目标列数']} 列 → "
                 f"**100% 精确 {_st2['完全匹配(100%)']} 格**"
                 + (f"（含经验库命中 {_nexp}）" if _nexp else "")
-                + (f"｜**非 100% {_n100} 格**（浅黄/浅蓝/浅紫，已在下方抽查区列出）" if _n100 else "｜无非100%格")
+                + (f"｜**非 100% {_n100} 格**（浅黄/浅蓝/浅紫，已在抽查区列出）" if _n100 else "｜无非100%格")
                 + f"｜留空 {_st2.get('留空合计', 0)}（待你选 {_amb}／源表缺 {_nmiss}）"
-                + f"｜复验一致率 {_st2.get('复验一致率', 100)}% → **需人工看 {_nd} 行**")
+                + (f"｜**两源交叉核对：{_ncmp} 格可比、矛盾 {_nbad}**" if _ncmp else "")
+                + (f" → **需你处理 {_nd} 格（涉及 {_nd_rows} 行）**" if _nd else ""))
             st.dataframe(_mfres["result"], height=420, width="stretch")
 
             # ---- 需人工确认：一行一选 → 写进经验库（下次自动填）----
@@ -1086,22 +1098,22 @@ elif mode == "多表补全":
                                 except Exception as _e2:
                                     st.error(f"写入经验库失败：{_e2}")
 
-            # ---- 抽查区：非 100% 的格 + 复验明细（默认展开，别让非100%藏起来）----
-            if (_pt is not None and len(_pt)) or (_ad is not None and len(_ad)):
-                with st.expander("② 抽查区（非 100% 的格 + 复验明细）", expanded=True):
+            # ---- 抽查区：非 100% 的格 + 两源矛盾（默认展开，别让非100%藏起来）----
+            if (_pt is not None and len(_pt)) or (_cx is not None and len(_cx)):
+                with st.expander("② 抽查区（非 100% 的格 + 两源矛盾）", expanded=True):
                     if _pt is not None and len(_pt):
                         st.caption(f"非 100% 的 {len(_pt)} 格：模糊匹配/多把钥匙补出来的，建议抽查")
                         st.dataframe(_pt, height=200, width="stretch")
-                    if _ad is not None and len(_ad):
-                        st.caption(f"复验存疑 {len(_ad)} 格（= 少用一把钥匙后结果会变，属预期；"
-                                   f"导出件里有「复验存疑」Sheet）")
-                        st.dataframe(_ad, height=200, width="stretch")
+                    if _cx is not None and len(_cx):
+                        st.caption(f"**两源矛盾 {len(_cx)} 格**：两张源表都能供这一列、但给的值不一样"
+                                   f"（真的需要你判一下；导出件里有「两源矛盾」Sheet）")
+                        st.dataframe(_cx, height=200, width="stretch")
             with st.expander("③ 细节（分档 / 用了哪几把钥匙 / 图例）"):
                 st.caption(f"高置信 {_st2['高置信(80-99%)']}｜中置信 {_st2['中置信(40-80%)']}｜"
                            f"低置信 {_st2['低置信(20-40%)']}｜有未补全格的行 {_st2['未补全行数']}｜"
                            f"级联轮数 {_st2.get('级联轮数', 1)}｜间接补全 {_st2.get('间接补全格数', 0)}｜"
                            f"多候选(已留空) {_amb}｜延后源表 {_st2.get('延后源表数', 0)}｜"
-                           f"经验库命中 {_nexp}｜复验可比 {_st2.get('复验可比格', 0)} 格")
+                           f"经验库命中 {_nexp}｜两源可比 {_ncmp} 格")
                 for _nm2, _kd2 in _st2.get("实际钥匙列", []):
                     st.caption(f"🔑 {_nm2}：{_kd2}")
                 for _nt2 in _st2.get("钥匙说明", []):
@@ -1114,11 +1126,13 @@ elif mode == "多表补全":
                 _fn2 = f"多表补全_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
                 _out2 = os.path.join(_OUT_DIR2, _fn2)
                 export_filled(_mfres["result"], _mfres["confidence"], _out2, stats=_st2,
-                              review_df=_mfres["review"], audit_df=_mfres.get("audit"))
+                              review_df=_mfres["review"], cross_df=_mfres.get("cross"),
+                              audit_df=_mfres.get("audit"))
                 with open(_out2, "rb") as _fh2:
                     st.download_button("⬇️ 下载补全表（带颜色与备注）", _fh2.read(), file_name=_fn2,
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                        key="mf_dl")
+                    save_to_folder(open(_out2, "rb").read(), _fn2, "fill")
                 st.success(f"已导出到项目内：data\\outputs\\{_fn2}")
             except Exception as e:
                 log_exception("多表补全导出失败", e)
@@ -1170,6 +1184,7 @@ elif mode == "表格美化":
                         st.download_button("⬇️ 下载美化后的文件", _bytes, file_name=_fn,
                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                            key="bt_dl")
+                        save_to_folder(_bytes, _fn, "beauty")
                         st.success(f"已生成新 Sheet「{_info['sheet']}」（原表未动，两 sheet 都在文件里）")
             except Exception as e:
                 log_exception("表格美化失败", e)

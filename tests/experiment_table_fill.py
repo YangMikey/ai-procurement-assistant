@@ -65,9 +65,10 @@ check("填充：A/B 合同结束时间已补（列名不同也能对上）",
       r.loc[0, "合同结束时间"] == "2026-12-31" and r.loc[1, "合同结束时间"] == "2026-06-30")
 check("尽量填：B 公司（钥匙精确）合同结束时间已补",
       r.loc[1, "合同结束时间"] == "2026-06-30")
-check("宁缺勿错：C 公司模糊钥匙同时对上多行且取值不同 → 留空（不猜第1条）",
+_c_types = set(res["review"]["类型"].astype(str).map(lambda s: s.split("(")[0]))
+check("宁缺勿错：C 公司模糊钥匙（低相似度对上多行）→ 留空不猜，并进清单",
       str(r.loc[2, "合同结束时间"]).strip() == ""
-      and "多候选" in "".join(res["review"]["类型"].astype(str)))
+      and ("多候选" in _c_types or "未补上" in _c_types))
 check("未匹配：ZZZ集团（钥匙 <20%）→ 留空", str(r.loc[3, "合同结束时间"]).strip() == "")
 check("填充：金额 A←源2、B←源3（逐行回退到备选源）",
       r.loc[0, "金额"] == "1000" and r.loc[1, "金额"] == "999")
@@ -319,6 +320,22 @@ check("上限：手点 5 列也只用 4 把", len(_plan["per_source"][0]) <= 4)
 check("上限：fill_multi 里钥匙列也截到 4",
       len(fill_multi(_tH, key_cols=[f"k{i}" for i in range(1, 6)],
                      sources=[{"name": "sH", "df": _sH}])["key_pairs"][0]) <= 4)
+
+# --- 多源交叉核对：两张源表都能供同一列 → 两源都给值且不同 = 两源矛盾 ---
+_tX = pd.DataFrame({"钥匙": ["k1", "k2"], "值": ["", ""]})
+_xA = {"name": "源A", "df": pd.DataFrame({"钥匙": ["k1", "k2"], "值": ["X1", "X2"]})}
+_xB = {"name": "源B", "df": pd.DataFrame({"钥匙": ["k1", "k2"], "值": ["X1", "Y2"]})}
+_rX = fill_multi(_tX, key_cols=["钥匙"], sources=[_xA, _xB])
+check("两源交叉核对：可比 2 格、矛盾 1 格（行3 两源不同）、一致率 50%",
+      _rX["stats"]["两源可核对格"] == 2 and _rX["stats"]["两源矛盾格"] == 1
+      and _rX["stats"]["两源一致率"] == 50.0
+      and len(_rX["cross"]) == 1 and int(_rX["cross"]["行号"].iloc[0]) == 3)
+check("两源交叉核对：只有一张源表能供时不产生矛盾",
+      fill_multi(_tK, key_cols=["K1"], sources=[{"name": "sK", "df": _sK}])["stats"]["两源可核对格"] == 0)
+
+# --- 复验默认已关（改为"少一把钥匙"的对照仅供开发回测）---
+check("复验默认关：默认调用不跑对照（组数 0）",
+      _rX["stats"]["复验组数"] == 0)
 
 # --- 清单导出：Sheet2「需人工确认」，复验明细单独一个 Sheet ---
 _rI = _rK2

@@ -70,11 +70,29 @@ try:
 except Exception:
     pass
 
-# 真跑一次「生成补全表」：走完 自动配钥匙 → 级联 → 复验 → 清单 → 抽查区 全链路
+# 真跑一次「生成补全表」：走完 自动配钥匙 → 级联 → 清单 → 抽查区 全链路
 if at.button(key="mf_go"):
     at.button(key="mf_go").click()
     at.run()
     check("UI：点「生成补全表」跑完全链路无异常", len(at.exception) == 0 and not at.error)
+
+# 「另存到指定文件夹」：目标目录设成临时目录 → 点按钮后文件应真的落地
+try:
+    import tempfile
+    from glob import glob
+    _td = os.path.join(tempfile.gettempdir(), "opencode", "ui_save")
+    os.makedirs(_td, exist_ok=True)
+    for _old in glob(os.path.join(_td, "*.xlsx")):
+        os.remove(_old)
+    if at.text_input(key="savedir_fill"):
+        at.text_input(key="savedir_fill").set_value(_td)
+        at.run()
+        at.button(key="savebtn_fill").click()
+        at.run()
+        check("UI：结果「另存到指定文件夹」真的写出文件",
+              not at.exception and len(glob(os.path.join(_td, "*.xlsx"))) >= 1)
+except Exception as e:
+    print("   [skip] 另存检查：", e)
 
 # 多表补全：源表来源切到「粘贴文件路径」（新增分支）应能渲染
 try:
