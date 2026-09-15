@@ -181,4 +181,100 @@ check("列供给标签：用源表名格式且不报错",
       len(_lbls) >= 1 and all("【" in x and "(" in x for x in _lbls)
       and any(x.startswith("源B") for x in _lbls))
 
+# ================= 新增：自动配钥匙（值域/同义/择优/延后/复验） =================
+from core.table_filler import pair_col, plan_keys, value_domain_sim
+
+# --- 同义与级别冲突（采购三级分类 ↔ 类别；一级分类 不可替代）---
+check("列名：采购三级分类 ↔ 类别 判同义（可替代）",
+      col_match("采购三级分类", "类别")[0] >= 90)
+check("列名：采购三级分类 ↔ 一级分类 判冲突（级别不同不可替代）",
+      col_match("采购三级分类", "一级分类")[1] == "冲突")
+
+# --- 值域指纹：列名完全对不上（'服务大类'），但取值集合一致 → 90 分「值域」---
+_vt = pd.Series(["绿化养护", "日常保洁", "生活垃圾清运", "消防维保", "四害消杀", "建筑垃圾清运"])
+_vs = pd.Series(["绿化养护", "日常保洁", "生活垃圾清运", "消防维保", "四害消杀", "建筑垃圾清运"])
+_ds, _cov = value_domain_sim(_vt, _vs)
+check("值域：两列取值一致 → 认定并给双向覆盖率", _ds >= 90 and _cov == 100)
+check("值域：列名对不上也能配对（方式=值域）",
+      pair_col("采购三级分类", "服务大类", _vt, _vs)[1] == "值域")
+_short = pd.Series(["A", "B", "C"])
+check("值域：唯一值太少不认（防小表误配）",
+      pair_col("采购三级分类", "服务大类", _short, _short)[0] == 0.0)
+
+# --- 自动补位：只点「项目名称」→ 系统自动补上能对上的第二把钥匙（值域）---
+_CATS = ["绿化养护", "日常保洁", "生活垃圾清运", "消防维保", "四害消杀", "建筑垃圾清运"]
+_DEPTS = ["华二第三事业部", "华二第一事业部", "华二第二事业部", "华二第一事业部",
+          "华二第二事业部", "华二第二事业部"]
+_tD = pd.DataFrame({"项目名称": ["朗晴居二期"] * 6 + ["朗晴居二期"], "采购三级分类": _CATS + ["绿化养护"],
+                    "事业部": [""] * 7})
+_tD.loc[6, "项目名称"] = "景安花园"
+_sD = pd.DataFrame({"项目名称": ["朗晴居二期"] * 6 + ["景安花园"], "服务大类": _CATS + ["绿化养护"],
+                    "事业部": _DEPTS + ["华二第三事业部"]})
+_rD = fill_multi(_tD, key_cols=["项目名称"], sources=[{"name": "sD", "df": _sD}])
+check("自动补钥匙：只用「项目名称」也会补上值域钥匙 → 每行各取正确行",
+      list(_rD["result"]["事业部"]) == _DEPTS + ["华二第三事业部"])
+check("自动补钥匙：备注标 2 钥匙、且无歧义格",
+      "2钥匙" in str(_rD["confidence"].loc[0, "事业部"]) and _rD["stats"]["歧义格数"] == 0)
+check("自动补钥匙：给了说明（哪张表补了哪把钥匙）",
+      any("自动补了钥匙列" in x for x in _rD["stats"]["钥匙说明"]))
+
+# --- 表级延后：单钥匙源表第 1 轮整表延后；第 2 轮凑到 2 把就用 2 把 ---
+_tE = pd.DataFrame({"项目名称": ["P1", "P1"], "采购三级分类": ["A", "B"],
+                    "合同编号": ["", ""], "金额": ["", ""]})
+_se1 = pd.DataFrame({"项目名称": ["P1", "P1"], "采购三级分类": ["A", "B"],
+                     "合同编号": ["C-A", "C-B"]})
+_se2 = pd.DataFrame({"项目名称": ["P1", "P1"], "合同编号": ["C-A", "C-B"], "金额": ["11", "22"]})
+_rE2 = fill_multi(_tE, key_cols=["项目名称"], sources=[{"name": "e1", "df": _se1},
+                                                      {"name": "e2", "df": _se2}],
+                  defer_single=True, max_rounds=4)
+check("表级延后：单钥匙源表被延后（计数 ≥1）", _rE2["stats"]["延后源表数"] >= 1)
+check("表级延后：第 2 轮凑到两把钥匙后才补（金额正确、备注含 2钥匙）",
+      list(_rE2["result"]["金额"]) == ["11", "22"]
+      and "2钥匙" in str(_rE2["confidence"].loc[0, "金额"]))
+
+# --- 表级延后：始终只有 1 把 → 仍按 1 把匹配（不是留空）---
+_tF = pd.DataFrame({"项目名称": ["Q1"], "金额": [""]})
+_sF = pd.DataFrame({"项目名称": ["Q1"], "金额": ["77"]})
+_rF2 = fill_multi(_tF, key_cols=["项目名称"], sources=[{"name": "f", "df": _sF}],
+                  defer_single=True, max_rounds=4)
+check("表级延后：始终单钥匙时照常补上（不留空）", str(_rF2["result"]["金额"].iloc[0]) == "77")
+check("表级延后：关掉延后开关也能补上",
+      str(fill_multi(_tF, key_cols=["项目名称"], sources=[{"name": "f", "df": _sF}],
+                     defer_single=False)["result"]["金额"].iloc[0]) == "77")
+
+# --- 复验：另换组合跑一遍 → 不一致的格进「需人工确认」清单 ---
+_rG = fill_multi(_tD, key_cols=["项目名称"], sources=[{"name": "sD", "df": _sD}],
+                 audit_rounds=2, audit_seed=42)
+check("复验：跑了 2 组、给出可比格与一致率",
+      _rG["stats"]["复验组数"] == 2 and _rG["stats"]["复验可比格"] > 0
+      and 0 <= _rG["stats"]["复验一致率"] <= 100)
+check("复验：换组合后取值不一致 → 记入清单（类型=复验不一致）",
+      _rG["stats"]["复验不一致格"] > 0
+      and set(_rG["review"]["类型"]) >= {"复验不一致"})
+check("复验：关掉复验则不跑（组数 0）",
+      fill_multi(_tD, key_cols=["项目名称"], sources=[{"name": "sD", "df": _sD}],
+                 audit_rounds=0)["stats"]["复验组数"] == 0)
+
+# --- 上限：每张源表最多 4 把钥匙（你点 5 列也只取前 4）---
+_tH = pd.DataFrame({f"k{i}": ["v"] for i in range(1, 6)})
+_tH["要补"] = [""]
+_sH = pd.DataFrame({f"k{i}": ["v"] for i in range(1, 6)})
+_sH["要补"] = ["x"]
+_plan = plan_keys(_tH, list(_tH.columns), [{"name": "sH", "df": _sH}],
+                  user_keys=[f"k{i}" for i in range(1, 6)], max_keys=4)
+check("上限：手点 5 列也只用 4 把", len(_plan["per_source"][0]) <= 4)
+check("上限：fill_multi 里钥匙列也截到 4",
+      len(fill_multi(_tH, key_cols=[f"k{i}" for i in range(1, 6)],
+                     sources=[{"name": "sH", "df": _sH}])["key_pairs"][0]) <= 4)
+
+# --- 清单导出：写成第二个 Sheet「需人工确认」---
+_rI = fill_multi(_tD, key_cols=["项目名称"], sources=[{"name": "sD", "df": _sD}],
+                 audit_rounds=2, audit_seed=42)
+_pI = os.path.join(os.path.dirname(TMP), "fill_review.xlsx")
+export_filled(_rI["result"], _rI["confidence"], _pI, stats=_rI["stats"], review_df=_rI["review"])
+_wbI = load_workbook(_pI)
+check("清单导出：有「需人工确认」Sheet 且列名齐全",
+      "需人工确认" in _wbI.sheetnames
+      and [c.value for c in _wbI["需人工确认"][1]][:3] == ["类型", "行号", "列名"])
+
 print(f"\n===== 多表补全测试通过：{ok} 项断言（离线）=====")

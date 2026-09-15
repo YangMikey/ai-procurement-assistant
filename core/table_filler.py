@@ -48,7 +48,14 @@ SYNONYM_GROUPS = [
     ("日期", "时间"),
     ("负责人", "责任人", "联系人"),
     ("备注", "说明", "备注说明"),
+    ("分类", "类别", "三级分类", "品类"),      # 采购三级分类 ↔ 类别/业务类别
 ]
+
+
+def _level_token(name):
+    """取「几级」里的级别字样（一级/二级/三级…），无则 None。"""
+    m = re.search(r"([一二三四五六123456])级", norm_col(name))
+    return m.group(1) if m else None
 
 
 def norm_col(name):
@@ -68,10 +75,13 @@ def _synonym_set(name):
 
 
 def _polarity_conflict(a, b):
-    """含税/不含税、总价/单价 这类"看起来像但含义不同"的列名，直接判为不可替代。"""
+    """含税/不含税、总价/单价、一级分类/三级分类 这类"看起来像但含义不同"的列名，直接判为不可替代。"""
     na, nb = norm_col(a), norm_col(b)
     tax_a, tax_b = ("不含税" in na or "未税" in na or "除税" in na), ("不含税" in nb or "未税" in nb or "除税" in nb)
     if tax_a != tax_b and ("税" in na or "税" in nb):
+        return True
+    la, lb = _level_token(a), _level_token(b)
+    if la and lb and la != lb:          # 一级分类 ≠ 三级分类
         return True
     return False
 
@@ -92,6 +102,62 @@ def col_match(tpl_col, src_col, threshold=COL_DEFAULT_THRESHOLD):
     if s >= 60:
         return float(s), "近似"
     return 0.0, "不匹配"
+
+
+def _uniq_vals(series, limit=800):
+    """取一列里"去重、归一化后非空"的取值（用于值域指纹比对）。"""
+    out, seen = [], set()
+    try:
+        it = series.tolist()
+    except Exception:
+        it = list(series)
+    for v in it:
+        if not _has_value(v):
+            continue
+        n = norm_text(v)
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+        if len(out) >= limit:
+            break
+    return out
+
+
+DOMAIN_MIN_UNIQ = 5        # 值域指纹：两边唯一值至少这么多才敢认
+DOMAIN_COVER = 0.8         # 值域指纹：双向覆盖率门槛
+
+
+def value_domain_sim(tpl_series, src_series, min_uniq=DOMAIN_MIN_UNIQ, cover=DOMAIN_COVER):
+    """值域指纹：列名对不上，但两列取值集合双向高度重叠 → 认定"同一类列"。
+
+    返回 (score, 双向覆盖率%)；不认则 (0.0, 0)。
+    只用于**列名不达标**时兜底，且要求唯一值够多（小表/枚举列不可靠）。
+    """
+    a, b = _uniq_vals(tpl_series), _uniq_vals(src_series)
+    if len(a) < min_uniq or len(b) < min_uniq:
+        return 0.0, 0
+    sa, sb = set(a), set(b)
+    ca = sum(1 for x in a if x in sb) / len(a)
+    cb = sum(1 for x in b if x in sa) / len(b)
+    if ca >= cover and cb >= cover:
+        return 90.0, int(round(min(ca, cb) * 100))
+    return 0.0, 0
+
+
+def pair_col(tpl_col, src_col, tpl_series=None, src_series=None,
+             threshold=COL_DEFAULT_THRESHOLD, allow_domain=True):
+    """列配对：先列名（同名/同义/近似）→ 不达标再试**值域指纹**（方式标「值域」）。"""
+    sc, how = col_match(tpl_col, src_col, threshold)
+    if sc >= threshold:
+        return sc, how
+    if how == "冲突":                      # 含税/级别这类语义冲突：不给兜底
+        return 0.0, how
+    if allow_domain and tpl_series is not None and src_series is not None:
+        ds, _ = value_domain_sim(tpl_series, src_series)
+        if ds >= threshold:
+            return ds, "值域"
+    return sc, how
 
 
 def _key_sim(a, b):
@@ -140,10 +206,12 @@ def _band(score):
     return "low"
 
 
-def _auto_key_pairs(template_keys, source, col_threshold, legacy_key_col=None):
+def _auto_key_pairs(template_keys, source, col_threshold, legacy_key_col=None,
+                    template_df=None, allow_domain=True):
     """模板钥匙列 ↔ 源表列 自动配对（按模板钥匙列顺序；同一源列不重复用）。
 
     legacy_key_col：兼容旧调用（源表手选单钥匙）→ 只把第一把钥匙配到该列。
+    template_df/allow_domain：给定模板表则可用**值域指纹**兜底（列名对不上也能认）。
     """
     df = source["df"]
     pairs = []
@@ -153,17 +221,137 @@ def _auto_key_pairs(template_keys, source, col_threshold, legacy_key_col=None):
         return pairs
     used = set()
     for tk in template_keys:
+        tser = template_df[tk] if (template_df is not None and tk in getattr(template_df, "columns", [])) else None
         best = None
         for col in df.columns:
             if col in used:
                 continue
-            sc, how = col_match(tk, col, col_threshold)
+            sc, how = pair_col(tk, col, tser, df[col], col_threshold, allow_domain)
             if sc >= col_threshold and (best is None or sc > best[1]):
                 best = (col, sc)
         if best:
             pairs.append((tk, best[0], best[1]))
             used.add(best[0])
     return pairs
+
+
+def _combo_score(template_df, src, pairs, key_min):
+    """自检打分：用这组钥匙去试，返回 (歧义率, 覆盖率, 列数)；越靠前越优。"""
+    if not pairs:
+        return None
+    df = src["df"]
+    tgt = None
+    for c in df.columns:
+        if c == src.get("key_col"):
+            continue
+        try:
+            if df[c].notna().any():
+                tgt = c
+                break
+        except Exception:
+            continue
+    if tgt is None:
+        return None
+    idx_cache = {}
+    covered = amb = 0
+    for i in template_df.index:
+        rv = {}
+        for tk, _scol, _cs in pairs:
+            if tk in template_df.columns and _has_value(template_df.at[i, tk]):
+                rv[tk] = norm_text(template_df.at[i, tk])
+        pa = [(tk, scol, cs) for tk, scol, cs in pairs if rv.get(tk)]
+        if not pa:
+            continue
+        m = _match_source(src, pa, rv, key_min, tgt, idx_cache)
+        if m is None:
+            continue
+        covered += 1
+        if m[3]:
+            amb += 1
+    if covered == 0:
+        return (1.0, 0.0, len(pairs))
+    return (amb / covered, covered / max(1, len(template_df)), len(pairs))
+
+
+def _better(a, b):
+    """a 是否比 b 更优：歧义率低 → 覆盖率高 → 列数少。"""
+    if a[0] < b[0] - 1e-9:
+        return True
+    if a[0] > b[0] + 1e-9:
+        return False
+    if a[1] > b[1] + 1e-9:
+        return True
+    if a[1] < b[1] - 1e-9:
+        return False
+    return a[2] < b[2]
+
+
+def plan_keys(template_df, key_candidates, sources, user_keys=(), mapping=None,
+              col_threshold=COL_DEFAULT_THRESHOLD, key_min=KEY_MIN,
+              max_keys=4, allow_domain=True):
+    """给每张源表定钥匙列（≤max_keys）：你点的列优先 → 不够时按自检指标补位。
+
+    返回 {"per_source": [pairs...], "notes": [说明...]}；pairs = [(模板列, 源列, 分)]
+    """
+    user_keys = list(user_keys or [])
+    mapping = mapping or {}
+    per_source, notes = [], []
+    for si, s in enumerate(sources):
+        pool = _auto_key_pairs(list(key_candidates), s, col_threshold, s.get("key_col"),
+                               template_df, allow_domain)
+        rank = {}
+        for p in pool:
+            if p[0] in user_keys:
+                rank[p[0]] = (0, user_keys.index(p[0]))
+            elif p[0] in mapping:
+                rank[p[0]] = (1, 0)
+            else:
+                rank[p[0]] = (2, 0)
+        pool = sorted(pool, key=lambda p: rank[p[0]])
+
+        chosen, chosen_tks = [], set()
+        for p in pool:                                  # 你点的列（该表能对上的）先拿走
+            if p[0] in user_keys and len(chosen) < max_keys:
+                chosen.append(p); chosen_tks.add(p[0])
+        for p in pool:                                  # 你手动映射过的列，视为你确认过
+            if p[0] in mapping and p[0] not in chosen_tks and len(chosen) < max_keys:
+                chosen.append(p); chosen_tks.add(p[0])
+
+        rest = [p for p in pool if p[0] not in chosen_tks]
+
+        def _has_any(tk):
+            return tk in template_df.columns and bool(template_df[tk].map(_has_value).any())
+
+        valued = [p for p in rest if _has_any(p[0])]      # 模板里有值 → 现在就能当钥匙
+        blank = [p for p in rest if not _has_any(p[0])]   # 现在没值 → 只能等级联补出来
+        best = _combo_score(template_df, s, chosen, key_min) if chosen else None
+        # 1) 先用"现在就能用"的列补位（按加进来后歧义率最低的顺序）
+        while valued and len(chosen) < max_keys:
+            trial_best = None
+            for p in valued:
+                sc = _combo_score(template_df, s, chosen + [p], key_min)
+                if sc is None:
+                    continue
+                if trial_best is None or _better(sc, trial_best[1]):
+                    trial_best = (p, sc)
+            if trial_best is None:
+                break
+            chosen.append(trial_best[0])
+            chosen_tks.add(trial_best[0][0])
+            valued = [p for p in valued if p[0] != trial_best[0][0]]
+            if best is None or _better(trial_best[1], best):
+                best = trial_best[1]
+        # 2) 还不够 2 把 → 补一个"结构上能对上、现在还没值"的列，留给级联当第二把钥匙
+        while blank and len(chosen) < min(2, max_keys):
+            chosen.append(blank.pop(0))
+            chosen_tks.add(chosen[-1][0])
+        auto = [p[0] for p in chosen if p[0] not in user_keys and p[0] not in mapping]
+        if auto:
+            notes.append(f"{s['name']}：自动补了钥匙列 {'、'.join(str(c) for c in auto)}")
+        if chosen and best is not None:
+            notes.append(f"{s['name']}：{len(chosen)} 把钥匙，歧义 {best[0]*100:.0f}%、覆盖 {best[1]*100:.0f}%")
+        per_source.append(chosen)
+    return {"per_source": per_source, "notes": notes}
 
 
 def _pick_row(rows, df, target_col, score, k, exact):
@@ -223,52 +411,74 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache):
 
 @skill(
     name="多表补全",
-    desc="按模板把多张源表汇总补齐：源表钥匙自动识别 + 分层钥匙匹配 + 级联多轮 + 置信分档上色",
-    inputs={"template_df": "模板表", "key_cols": "模板钥匙列(1~5，按优先级)",
+    desc="按模板把多张源表汇总补齐：自动配钥匙列(≤4，含值域识别) + 单钥匙源表延后 + 随机换组合复验 + 置信分档上色",
+    inputs={"template_df": "模板表", "key_cols": "模板钥匙列(≤4，按优先级，可留空交给自动)",
             "sources": "[{name, df}]（源表钥匙由系统自动识别）", "mapping": "模板列→源列（可选覆盖）",
             "col_threshold": "列名匹配阈值(默认70)", "key_min": "钥匙最低分(默认20)",
-            "max_rounds": "级联最大轮数(默认4)", "promote_min": "升级为钥匙的置信门槛(默认80)"},
+            "max_rounds": "级联最大轮数(默认4)", "promote_min": "升级为钥匙的置信门槛(默认80)",
+            "auto_keys": "自动补钥匙列(默认开)", "defer_single": "单钥匙源表第1轮延后(默认开)",
+            "audit_rounds": "随机换组合复验组数(默认2)", "audit_seed": "复验随机种子(默认42)"},
     outputs={"result": "补全后的表", "confidence": "逐格置信度(含轮次)", "stats": "统计",
-             "supply": "列供给", "legend": "图例/说明"},
+             "supply": "列供给", "legend": "图例/说明", "review": "需人工确认清单"},
     task_modes=["多表补全"],
 )
 def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                col_threshold=COL_DEFAULT_THRESHOLD, key_min=KEY_MIN,
-               key_cols=None, max_rounds=MAX_ROUNDS, promote_min=PROMOTE_MIN):
-    """多源 → 模板 单向填充（分层钥匙 + 级联）。返回 {result, confidence, stats, supply, legend}。
+               key_cols=None, max_rounds=MAX_ROUNDS, promote_min=PROMOTE_MIN,
+               auto_keys=True, defer_single=True, audit_rounds=2, audit_seed=42,
+               allow_domain=True, key_plan=None, _audit=False, max_keys=4):
+    """多源 → 模板 单向填充（自动配钥匙 + 分层钥匙 + 级联 + 复验）。
 
-    - 模板钥匙列 1~5 个（key_cols；兼容旧 key_col 单钥匙）
-    - 源表**不用选钥匙**：按模板钥匙列自动配对（同名/同义/近似 ≥ col_threshold）
-    - 分层：钥匙层 n→1，层内先精确后模糊；命中即停
-    - 级联：最多 max_rounds 轮，某轮无新增即停；补出的值若 ≥ promote_min 可当钥匙（多跳置信 ×0.9/跳）
+    - 模板钥匙列 ≤4 个（你点的列优先；不够时自动按"歧义率低→覆盖率高→列数少"补位）
+    - 源表钥匙自动配对：列名（同名/同义/近似）→ 不达标再试**值域指纹**
+    - 单钥匙源表：第 1 轮整表延后，第 2 轮起能凑到 ≥2 把就用复合钥匙，仍只有 1 把就按 1 把匹配
+    - 级联：最多 max_rounds 轮，某轮无新增即停；补出的值 ≥ promote_min 才可当钥匙（×0.9/跳）
+    - 复验：另外随机换 1~2 组钥匙列再跑一遍，两次取值不一致的格进「需人工确认」清单
     """
     sources = list(sources or [])
     mapping = mapping or {}
     tkeys = list(key_cols) if key_cols else ([key_col] if key_col else [])
-    tkeys = [c for c in tkeys if c in template_df.columns][:5]
-    if not tkeys:
+    tkeys = [c for c in tkeys if c in template_df.columns][:max_keys]
+    if not tkeys and not auto_keys:
         raise ValueError("请至少指定 1 个模板钥匙列")
     target_cols = [c for c in template_df.columns if c not in tkeys]
 
-    # 可作为钥匙的列 = 模板钥匙列 + "能被某张源表当钥匙对上"的目标列（级联用）
-    extra_keys = [c for c in target_cols
-                  if any(col_match(c, col, col_threshold)[0] >= col_threshold
-                         for s in sources for col in s["df"].columns)]
-    key_candidates = tkeys + extra_keys
+    def _pairable(tpl_col, s):
+        return any(pair_col(tpl_col, c, template_df[tpl_col], s["df"][c],
+                            col_threshold, allow_domain)[0] >= col_threshold
+                   for c in s["df"].columns)
 
-    key_pairs = [_auto_key_pairs(key_candidates, s, col_threshold, s.get("key_col"))
-                 for s in sources]
+    # 可作为钥匙的列 = 模板钥匙列 + "能被某张源表当钥匙对上"的目标列（级联/自动补位用）
+    extra_keys = [c for c in target_cols if any(_pairable(c, s) for s in sources)]
+    key_candidates = tkeys + extra_keys
+    if not key_candidates:
+        raise ValueError("没有可用于匹配的钥匙列：请指定模板钥匙列")
+
+    # ---- 定钥匙列（每张源表各自 ≤max_keys 把） ----
+    if key_plan is not None:
+        plan = {"per_source": key_plan, "notes": []}
+    elif auto_keys:
+        plan = plan_keys(template_df, key_candidates, sources, user_keys=tkeys,
+                         mapping=mapping, col_threshold=col_threshold,
+                         key_min=key_min, max_keys=max_keys, allow_domain=allow_domain)
+    else:
+        plan = {"per_source": [_auto_key_pairs(tkeys or key_candidates, s, col_threshold,
+                                               s.get("key_col"), template_df, allow_domain)
+                               for s in sources], "notes": []}
+    key_pairs = plan["per_source"]
     supply = discover_supply(target_cols, sources, col_threshold, mapping)
 
     result = template_df.copy()
     conf = pd.DataFrame("", index=template_df.index, columns=list(result.columns))
-    filled = {}          # (i, col) -> (decayed_score, round, k_used, tie_n)
+    filled = {}          # (i, col) -> (decayed_score, 有效轮次, k_used, tie_n)
+    gen = {}             # (i, col) -> 生成代：原值=0；用原值补出=1；用补出值再补=2…
     idx_cache = {}
     n_fill = {"ok": 0, "high": 0, "mid": 0, "low": 0, "miss": 0}
-    rounds_used = 0
+    eff_rounds = 0       # 有效轮数 = 真正补出东西的轮数（"延后"不占轮）
+    deferred_sources = set()
 
     for r in range(1, int(max_rounds) + 1):
-        # 本轮开始时快照"可用钥匙"（本轮新补出的值下一轮才生效 → 级联逐轮推进、轮次可解释）
+        # 本轮开始快照"可用钥匙"（本轮新补出的值下一轮才生效 → 级联逐轮推进、轮次可解释）
         avail_by_row = {}
         for i in template_df.index:
             rv = {}
@@ -279,7 +489,26 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                 if sc >= promote_min:          # 仅"原有值或高置信补出值"可当钥匙
                     rv[kc] = norm_text(result.at[i, kc])
             avail_by_row[i] = rv
+
+        # 表级可用钥匙数：该源表本轮真正能用上的钥匙列（模板里有值的）
+        usable_cols = []
+        for si in range(len(sources)):
+            cols = {tk for tk, _sc, _cs in key_pairs[si]
+                    if any(tk in (avail_by_row.get(i) or {}) for i in template_df.index)}
+            usable_cols.append(cols)
+
+        # 单钥匙源表：第 1 轮整表延后（等后续轮次看能不能凑到第二把）
+        active = []
+        for si in range(len(sources)):
+            if not usable_cols[si]:
+                continue
+            if defer_single and r == 1 and len(usable_cols[si]) == 1:
+                deferred_sources.add(si)
+                continue
+            active.append(si)
+
         progressed = False
+        round_fills = []                 # 本轮补出的格，等"有效轮次"定稿后再写备注
         for tcol in target_cols:
             for i in template_df.index:
                 if _has_value(result.at[i, tcol]):
@@ -288,7 +517,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                 if not row_vals:
                     continue
                 best = None
-                for si, s in enumerate(sources):
+                for si in active:
+                    s = sources[si]
                     # 匹配用钥匙：本行可得 & 不是"目标列自己"（防自引用）
                     pairs = [(tk, scol, cs) for tk, scol, cs in key_pairs[si]
                              if tk in row_vals and tk != tcol]
@@ -308,25 +538,36 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                         if not _has_value(v):
                             continue
                         if best is None or sc > best[1]:
-                            best = (v, sc, k_used, tie_n, cand["how"])
+                            best = (v, sc, k_used, tie_n, cand["how"], pairs)
                 if best:
-                    v, sc, k_used, tie_n, how = best
-                    decayed = sc * (0.9 ** (r - 1))
+                    v, sc, k_used, tie_n, how, pairs = best
+                    used_tks = [tk for tk, _c, _s in pairs][:k_used]
+                    # 折减按**跳数**：只用原值钥匙 → 不折减；用了补出来的值 → 每跳 ×0.9
+                    g = max((gen.get((i, tk), 0) for tk in used_tks), default=0)
+                    decayed = sc * (0.9 ** g)
                     result.at[i, tcol] = v
-                    filled[(i, tcol)] = (decayed, r, k_used, tie_n)
-                    band = _band(decayed)
-                    tag = f"{band}:{decayed:.0f}@{r}"
-                    if k_used > 1:
-                        tag += f"·{k_used}钥匙"
-                    if tie_n:
-                        tag += f"·歧义{tie_n}行"
-                    conf.at[i, tcol] = tag
-                    n_fill[band] += 1
+                    filled[(i, tcol)] = (decayed, 0, k_used, tie_n)   # 轮次稍后回填
+                    gen[(i, tcol)] = g + 1
+                    n_fill[_band(decayed)] += 1
+                    round_fills.append((i, tcol, decayed, k_used, tie_n))
                     progressed = True
+
         if progressed:
-            rounds_used = r
+            eff_rounds += 1
+            for i, tcol, decayed, k_used, tie_n in round_fills:
+                _sc0, _r0, _k0, _t0 = filled[(i, tcol)]
+                filled[(i, tcol)] = (decayed, eff_rounds, k_used, tie_n)
+                tag = f"{_band(decayed)}:{decayed:.0f}@{eff_rounds}"
+                if k_used > 1:
+                    tag += f"·{k_used}钥匙"
+                if tie_n:
+                    tag += f"·歧义{tie_n}行"
+                conf.at[i, tcol] = tag
+        elif r == 1 and deferred_sources:
+            continue                      # 第 1 轮只是"延后"，不算收敛
         else:
             break
+    rounds_used = eff_rounds
 
     for i in template_df.index:
         for tcol in target_cols:
@@ -336,20 +577,112 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
 
     indirect = sum(1 for _, (_, rr, _, _) in filled.items() if rr > 1)
     ambiguous = sum(1 for _, (_, _, _, tie) in filled.items() if tie)
+
+    # ---- 复验：随机换钥匙列组合再跑一遍，两次取值不一致的格 → 人工清单 ----
+    audit = {"组数": 0, "可比格": 0, "不一致": []}
+    if audit_rounds and not _audit:
+        import random
+        rng = random.Random(int(audit_seed or 0))
+        pool_all = [_auto_key_pairs(list(key_candidates), s, col_threshold, s.get("key_col"),
+                                    template_df, allow_domain) for s in sources]
+        for a in range(int(audit_rounds)):
+            alt = []
+            for si in range(len(sources)):
+                main = key_pairs[si]
+                main_tks = {p[0] for p in main}
+                others = [p for p in pool_all[si] if p[0] not in main_tks]
+                alts = []
+                if len(main) >= 2:                       # ① 少用一把钥匙
+                    alts.append(main[:-1])
+                if len(others) >= 2:                     # ② 换成池里另外两把
+                    alts.append(rng.sample(others, 2))
+                elif others:                             # ③ 换成池里另一把
+                    alts.append([others[0]])
+                if main:
+                    alts.append(main[:1])                # ④ 退到单钥匙
+                alt.append(alts[a % len(alts)] if alts else main)
+            try:
+                r2 = fill_multi(template_df, key_cols=tkeys, sources=sources, mapping=mapping,
+                                col_threshold=col_threshold, key_min=key_min,
+                                max_rounds=max_rounds, promote_min=promote_min,
+                                auto_keys=False, defer_single=defer_single,
+                                audit_rounds=0, allow_domain=allow_domain,
+                                key_plan=alt, _audit=True, max_keys=max_keys)
+            except Exception:
+                continue
+            audit["组数"] += 1
+            res2 = r2["result"]
+            for tcol in target_cols:
+                for i in template_df.index:
+                    a1, a2 = result.at[i, tcol], res2.at[i, tcol]
+                    if _has_value(a1) and _has_value(a2):
+                        audit["可比格"] += 1
+                        if norm_text(a1) != norm_text(a2):
+                            audit["不一致"].append({"行号": i + 2, "列名": tcol,
+                                                    "钥匙值": _row_key_text(template_df, i, key_pairs),
+                                                    "主结果": a1, "复验结果": a2})
+    n_cmp = audit["可比格"]
+    n_diff = len(audit["不一致"])
+    consistency = (1.0 - n_diff / n_cmp) if n_cmp else 1.0
+
+    # ---- 需人工确认清单（3 类：留空 / 复验不一致 / 多候选）----
+    review = []
+    for d in audit["不一致"]:
+        review.append({"类型": "复验不一致", **d})
+    for i in template_df.index:
+        for tcol in target_cols:
+            if not _has_value(result.at[i, tcol]) and not _has_value(template_df.at[i, tcol]):
+                review.append({"类型": "未补上", "行号": i + 2, "列名": tcol,
+                               "钥匙值": _row_key_text(template_df, i, key_pairs),
+                               "主结果": "", "复验结果": ""})
+    for (i, tcol), (_sc, _rr, _k, tie) in filled.items():
+        if tie:
+            review.append({"类型": "多候选", "行号": i + 2, "列名": tcol,
+                           "钥匙值": _row_key_text(template_df, i, key_pairs),
+                           "主结果": result.at[i, tcol], "复验结果": ""})
+    review_df = pd.DataFrame(review, columns=["类型", "行号", "列名", "钥匙值", "主结果", "复验结果"]) \
+        if review else pd.DataFrame(columns=["类型", "行号", "列名", "钥匙值", "主结果", "复验结果"])
+
+    # 每张源表实际用了哪几把钥匙（给界面显示）
+    key_used_desc = [(sources[si]["name"],
+                      "、".join(str(tk) for tk, _c, _s in key_pairs[si]) or "—")
+                     for si in range(len(sources))]
+
     stats = {"模板行数": len(template_df), "目标列数": len(target_cols),
              "可填格": len(template_df) * len(target_cols),
              "完全匹配(100%)": n_fill["ok"], "高置信(80-99%)": n_fill["high"],
              "中置信(40-80%)": n_fill["mid"], "低置信(20-40%)": n_fill["low"],
              "未匹配(留空)": n_fill["miss"],
              "级联轮数": rounds_used, "间接补全格数": indirect, "歧义格数": ambiguous,
+             "延后源表数": len(deferred_sources),
+             "复验组数": audit["组数"], "复验可比格": n_cmp, "复验不一致格": n_diff,
+             "复验一致率": round(consistency * 100, 1),
+             "需人工确认行数": len(review_df),
+             "实际钥匙列": key_used_desc, "钥匙说明": plan["notes"],
              "未补全行数": int((conf[target_cols] == "miss").any(axis=1).sum()) if target_cols else 0}
     return {"result": result, "confidence": conf, "stats": stats,
-            "supply": supply, "legend": legend_lines(stats), "key_pairs": key_pairs}
+            "supply": supply, "legend": legend_lines(stats), "key_pairs": key_pairs,
+            "review": review_df}
 
 
-def preview_keys(template_keys, sources, col_threshold=COL_DEFAULT_THRESHOLD):
+def _row_key_text(template_df, i, key_pairs):
+    """清单里显示该行的钥匙值（各源表第一把钥匙的模板列）。"""
+    names = []
+    for pr in key_pairs:
+        if pr and str(pr[0][0]) not in names:
+            names.append(str(pr[0][0]))
+    vals = []
+    for nm in names[:3]:
+        if nm in template_df.columns and _has_value(template_df.at[i, nm]):
+            vals.append(f"{nm}={template_df.at[i, nm]}")
+    return " | ".join(vals)
+
+
+def preview_keys(template_keys, sources, col_threshold=COL_DEFAULT_THRESHOLD,
+                 template_df=None, allow_domain=True):
     """界面预览：每张源表自动识别到的钥匙列 → [(源表名, [(模板钥匙列, 源列, 分)])]。"""
-    return [(s["name"], _auto_key_pairs(list(template_keys), s, col_threshold, s.get("key_col")))
+    return [(s["name"], _auto_key_pairs(list(template_keys), s, col_threshold, s.get("key_col"),
+                                        template_df, allow_domain))
             for s in sources]
 
 
@@ -405,10 +738,18 @@ def legend_lines(stats):
         extra.append(f"含 {stats['间接补全格数']} 格为多轮间接补全（置信已按跳数折减）")
     if stats.get("歧义格数"):
         extra.append(f"有 {stats['歧义格数']} 格命中多行且取值不同，已取第 1 条，请核对")
+    if stats.get("延后源表数"):
+        extra.append(f"有 {stats['延后源表数']} 张源表第 1 轮延后（只有 1 把钥匙，等后续轮次凑第二把）")
+    if stats.get("复验组数"):
+        extra.append(f"复验：另换 {stats['复验组数']} 组钥匙列跑了一遍，"
+                     f"可比 {stats.get('复验可比格', 0)} 格、一致率 {stats.get('复验一致率', 100)}%"
+                     f"（不一致 {stats.get('复验不一致格', 0)} 格，见「需人工确认」清单）")
+    if stats.get("需人工确认行数"):
+        extra.append(f"需人工确认：{stats['需人工确认行数']} 行（清单见第二个 Sheet）")
     return lines + extra
 
 
-def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None):
+def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, review_df=None):
     """写出带颜色的整合表 + 下方备注块（表头/列宽/冻结/筛选/数字格式由 theme 统一处理）。"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -438,5 +779,17 @@ def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None):
     if extra_notes:
         notes += list(extra_notes)
     _style(ws, 1, highlight_min=False, footer_lines=notes or None)
+
+    # 需人工确认清单（只在有内容时加这个 Sheet）
+    try:
+        if review_df is not None and len(review_df):
+            ws2 = wb.create_sheet("需人工确认")
+            ws2.append([str(c) for c in review_df.columns])
+            for _, row in review_df.iterrows():
+                ws2.append(["" if (v is None or (not isinstance(v, str) and pd.isna(v))) else v
+                            for v in row])
+            _style(ws2, 1, highlight_min=False)
+    except Exception:
+        pass
     wb.save(out_path)
     return out_path

@@ -66,7 +66,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-14.12"
+BUILD = "2026-09-15.01"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -899,12 +899,13 @@ elif mode == "多表补全":
     if _tpl_src:
         _tpl_df, _tpl_sheet, _tpl_hdr = load_table(_tpl_src, file_key("tpl", _tpl_src["name"], _tpl_src["path"]))
         if _tpl_df is not None and len(_tpl_df.columns):
-            _picked = pick_columns(_tpl_df, "🔑 模板·钥匙列（可多选，最多 5 个；点击顺序=优先级）",
+            _picked = pick_columns(_tpl_df, "🔑 模板·钥匙列（可多选，最多 4 个；点击顺序=优先级；不点也行，系统自己找）",
                                    key=file_key("tplkey", _tpl_src["name"], _tpl_sheet, _tpl_hdr))
-            _tkeys = [c for c in _picked if c in _tpl_df.columns][:5] or [list(_tpl_df.columns)[0]]
+            _tkeys = [c for c in _picked if c in _tpl_df.columns][:4]
             st.caption(f"模板：{len(_tpl_df)} 行 × {len(_tpl_df.columns)} 列；"
-                       f"钥匙列（{len(_tkeys)} 个，按优先级）= **{'、'.join(str(c) for c in _tkeys)}**；"
-                       f"待补列：{'、'.join(str(c) for c in _tpl_df.columns if c not in _tkeys)}")
+                       + (f"钥匙列（{len(_tkeys)} 个，按优先级）= **{'、'.join(str(c) for c in _tkeys)}**；"
+                          if _tkeys else "钥匙列：**交给系统自动找**；")
+                       + f"待补列：{'、'.join(str(c) for c in _tpl_df.columns if c not in _tkeys)}")
 
     st.subheader("② 源表（可多张）")
     _src_kind = st.radio("源表来源", ["上传文件（可多选）", "从项目 raw_quotes 目录选"],
@@ -931,7 +932,7 @@ elif mode == "多表补全":
             st.caption(f"可用列：{'、'.join(str(c) for c in _df2.columns)}")
             _sources.append({"name": _nm, "df": _df2})
 
-    if _tpl_df is not None and _tkeys and _sources:
+    if _tpl_df is not None and len(_tpl_df.columns) and _sources:
         st.subheader("③ 列供给（自动发现，可改）")
         _c1, _c2, _c3, _c4 = st.columns(4)
         with _c1:
@@ -945,9 +946,20 @@ elif mode == "多表补全":
         with _c4:
             _pmin2 = st.slider("升级为钥匙门槛", 50, 100, 80, key="mf_promote",
                                help="补出的值置信 ≥ 此分才允许当钥匙去补别的列")
+        _autok2 = st.checkbox("自动配钥匙列（推荐）", value=True, key="mf_autokey",
+                              help="系统自己找列、自动组合最多 4 把（你点的列优先）；关掉就只用你点的列")
+        with st.expander("高级（一般不用动）"):
+            _dom2 = st.checkbox("允许按内容识别钥匙列（列名对不上时）", value=True, key="mf_domain",
+                                help="两列取值高度重合就认成同一类列；小表（唯一值<5）不启用")
+            _def2 = st.checkbox("只有 1 把钥匙的源表第 1 轮先延后", value=True, key="mf_defer",
+                                help="等后续轮次凑到第二把钥匙再两把一起用；始终只有 1 把就按 1 把匹配")
+            _aud2 = st.slider("复验：另换几组钥匙列再跑一遍（0=不复验）", 0, 3, 2, key="mf_audit",
+                              help="两次取值不一致的格会进「需人工确认」清单")
+            _seed2 = st.number_input("复验随机种子", 0, 99999, 42, key="mf_seed")
         try:
             from core.table_filler import preview_keys as _pk
-            _kp = _pk(_tkeys, _sources, float(_thr2))
+            _kp = _pk(_tkeys or list(_tpl_df.columns)[:1], _sources, float(_thr2),
+                      template_df=_tpl_df, allow_domain=bool(_dom2))
             _hint = "；".join(f"{nm}: " + ("、".join(f"{tk}←{sc}" for tk, sc, _ in pr) or "未识别到")
                               for nm, pr in _kp)
             st.caption(f"🔑 源表钥匙自动识别（按模板钥匙列）：{_hint}")
@@ -974,11 +986,13 @@ elif mode == "多表补全":
 
         if st.button("生成补全表", type="primary", key="mf_go"):
             try:
-                with st.spinner("填充中…（含自动级联）"):
+                with st.spinner("填充中…（自动配钥匙 + 级联 + 复验）"):
                     _res2 = fill_multi(_tpl_df, key_cols=_tkeys, sources=_sources,
                                        mapping=_mapping2, col_threshold=float(_thr2),
                                        key_min=float(_kmin2), max_rounds=int(_rnd2),
-                                       promote_min=float(_pmin2))
+                                       promote_min=float(_pmin2), auto_keys=bool(_autok2),
+                                       defer_single=bool(_def2), audit_rounds=int(_aud2),
+                                       audit_seed=int(_seed2), allow_domain=bool(_dom2))
                 st.session_state["mf_res"] = _res2
             except Exception as e:
                 log_exception("多表补全失败", e)
@@ -988,17 +1002,36 @@ elif mode == "多表补全":
         if _mfres:
             st.subheader("④ 结果（预览见下方；下载件带颜色与备注）")
             _st2 = _mfres["stats"]
-            st.caption(f"完全匹配 {_st2['完全匹配(100%)']}｜高置信 {_st2['高置信(80-99%)']}｜"
-                       f"中置信 {_st2['中置信(40-80%)']}｜低置信 {_st2['低置信(20-40%)']}｜"
-                       f"未匹配(留空) {_st2['未匹配(留空)']}｜有未补全格的行：{_st2['未补全行数']}｜"
-                       f"级联轮数 {_st2.get('级联轮数', 1)}｜间接补全 {_st2.get('间接补全格数', 0)}｜"
-                       f"歧义格 {_st2.get('歧义格数', 0)}")
+            _nd = _st2.get("需人工确认行数", 0)
+            _lv = _st2.get("复验一致率", 100)
+            st.markdown(
+                f"**结论**：{_st2['模板行数']} 行 → 补上 {_st2['完全匹配(100%)'] + _st2['高置信(80-99%)']} 格"
+                f"完全匹配 {_st2['完全匹配(100%)']}、"
+                f"需复核 {_st2['低置信(20-40%)'] + _st2['歧义格数']}，"
+                f"留空 {_st2['未匹配(留空)']}；换组合复验一致率 {_lv}%"
+                f"（不一致 {_st2.get('复验不一致格', 0)} 格）→ **需人工看 {_nd} 行**")
+            with st.expander("看细节（分档 / 用了哪几把钥匙 / 图例）"):
+                st.caption(f"高置信 {_st2['高置信(80-99%)']}｜中置信 {_st2['中置信(40-80%)']}｜"
+                           f"低置信 {_st2['低置信(20-40%)']}｜有未补全格的行 {_st2['未补全行数']}｜"
+                           f"级联轮数 {_st2.get('级联轮数', 1)}｜间接补全 {_st2.get('间接补全格数', 0)}｜"
+                           f"歧义格 {_st2.get('歧义格数', 0)}｜延后源表 {_st2.get('延后源表数', 0)}")
+                for _nm2, _kd2 in _st2.get("实际钥匙列", []):
+                    st.caption(f"🔑 {_nm2}：{_kd2}")
+                for _nt2 in _st2.get("钥匙说明", []):
+                    st.caption(f"· {_nt2}")
+                st.caption("颜色图例：" + "；".join([
+                    "无色=完全匹配(100%)", "浅黄=高置信(80–99%)", "浅蓝=中置信(40–80%)",
+                    "浅紫=低置信(20–40%)", "浅灰底空格=未匹配"]))
             st.dataframe(_mfres["result"], height=420, width="stretch")
+            if len(_mfres["review"]):
+                st.markdown(f"**需人工确认 {len(_mfres['review'])} 行**")
+                st.dataframe(_mfres["review"], height=220, width="stretch")
             try:
                 os.makedirs(_OUT_DIR2, exist_ok=True)
                 _fn2 = f"多表补全_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
                 _out2 = os.path.join(_OUT_DIR2, _fn2)
-                export_filled(_mfres["result"], _mfres["confidence"], _out2, stats=_st2)
+                export_filled(_mfres["result"], _mfres["confidence"], _out2, stats=_st2,
+                              review_df=_mfres["review"])
                 with open(_out2, "rb") as _fh2:
                     st.download_button("⬇️ 下载补全表（带颜色与备注）", _fh2.read(), file_name=_fn2,
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
