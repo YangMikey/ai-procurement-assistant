@@ -121,8 +121,8 @@ else:
             f"填 {m2['填格']}｜对 {m2['对']}｜**错 {m2['错']}**｜留空 {m2['留空']}"
             f"｜歧义格 {r2['stats']['歧义格数']}",
             f"  实际钥匙列：{r2['stats']['实际钥匙列']}",
-            f"  需人工确认：必看 {int((r2['review']['优先级'] == '必看').sum())} 行，"
-            f"建议看 {int((r2['review']['优先级'] == '建议看').sum())} 行",
+            f"  需人工确认：{int(len(r2['review']))} 行（多候选留空/未补上）；"
+            f"复验存疑明细 {int(len(r2['audit']))} 格（不进主清单）",
             ""])
         for b in m1["错行"][:5]:
             lines.append(f"    {t1}错：行{b[0]} {b[1]}/{b[2]} 填了 {b[3]}，应为 {b[4]}")
@@ -157,12 +157,12 @@ else:
     check("场景C（随分类变化）：改前会填错（错 >0）", mC1["错"] > 0)
     check("场景C：改后错值归零（靠自动配钥匙 + 歧义留空）", mC2["错"] == 0)
     check("场景C：改后是靠自动补的第二把钥匙定下来的", len(rC2["stats"]["钥匙说明"]) > 0)
-    check("场景C：改后歧义格进清单（必看/多候选）",
+    check("场景C：改后歧义格进清单（多候选留空）",
           rC2["stats"]["歧义格数"] > 0
           and "多候选" in "".join(rC2["review"]["类型"].astype(str)))
-    check("场景C：清单排序必看在前",
-          list(rC2["review"]["优先级"]) == sorted(rC2["review"]["优先级"],
-                                                  key=lambda x: 0 if x == "必看" else 1))
+    check("场景C：清单只收必看（复验明细另存 audit）",
+          set(rC2["review"]["类型"].astype(str).map(lambda s: s.split("(")[0])) <= {"多候选", "未补上"}
+          and "复验不一致" not in set(rC2["review"]["类型"]))
     check("场景B：换一张真实表也能补上（自动认出「类别」）", n_fillB >= 5)
     check("场景B：对上人工答案的错值 ≤1 行", mB["错"] <= 1)
 

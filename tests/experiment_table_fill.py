@@ -152,10 +152,9 @@ check("三跳链：B/C/D 全部补出，轮数=3", list(rE["result"][["B", "C", 
 tplF = pd.DataFrame({"钥匙": ["k1"], "值": [""]})
 f1 = pd.DataFrame({"钥匙": ["k1", "k1"], "值": ["X", "Y"]})
 rF = fill_multi(tplF, key_cols=["钥匙"], sources=[{"name": "f1", "df": f1}])
-check("歧义：命中多行取值不同 → 留空 + 进清单（必看/多候选）",
+check("歧义：命中多行取值不同 → 留空 + 进清单（多候选）",
       str(rF["result"]["值"].iloc[0]).strip() == "" and rF["stats"]["歧义格数"] == 1
-      and len(rF["review"]) == 1 and rF["review"]["优先级"].iloc[0] == "必看"
-      and "多候选" in str(rF["review"]["类型"].iloc[0]))
+      and len(rF["review"]) == 1 and "多候选" in str(rF["review"]["类型"].iloc[0]))
 # 并列多行但取值相同 → 直接用，不算歧义
 tplF2 = pd.DataFrame({"钥匙": ["k1"], "值": [""]})
 f2 = pd.DataFrame({"钥匙": ["k1", "k1"], "值": ["Z", "Z"]})
@@ -263,19 +262,51 @@ _rK2 = fill_multi(_tK, key_cols=["K1"], sources=[{"name": "sK", "df": _sK}], aud
 check("复验：跑降级对照（自动去重）、给出可比格与一致率",
       _rK2["stats"]["复验组数"] >= 1 and _rK2["stats"]["复验可比格"] > 0
       and 0 <= _rK2["stats"]["复验一致率"] <= 100)
-check("复验：少一把钥匙后给出**不同值** → 记入清单（复验不一致/建议看）",
-      _rK2["stats"]["复验不一致格"] > 0
-      and "复验不一致" in set(_rK2["review"]["类型"])
-      and set(_rK2["review"][_rK2["review"]["类型"] == "复验不一致"]["优先级"]) == {"建议看"})
-check("清单排序：「必看」在前、「建议看」在后",
-      list(_rK2["review"]["优先级"]) == sorted(_rK2["review"]["优先级"],
-                                              key=lambda x: 0 if x == "必看" else 1))
+check("复验：降级后给出**不同值** → 记入明细（不进主清单）",
+      _rK2["stats"]["复验不一致格"] > 0 and len(_rK2["audit"]) > 0
+      and "复验不一致" not in set(_rK2["review"]["类型"]))
+check("清单只收「必看」：多候选(已留空) / 未补上 两类",
+      set(_rK2["review"]["类型"].astype(str).map(lambda s: s.split("(")[0])) <= {"多候选", "未补上"})
 check("复验：降级后只是\"定不出来\"→ 不算存疑（不当噪声）",
       fill_multi(_tD, key_cols=["项目名称"], sources=[{"name": "sD", "df": _sD}],
                  audit_rounds=2)["stats"]["复验不一致格"] == 0)
 check("复验：关掉复验则不跑（组数 0）",
       fill_multi(_tK, key_cols=["K1"], sources=[{"name": "sK", "df": _sK}],
                  audit_rounds=0)["stats"]["复验组数"] == 0)
+
+# --- 回归：类型守卫（"到期/截止"日期口径 与 "终止"状态口径 不许混）---
+check("列名：合同到期月份 ↔ 终止状态 不再判同义（曾误判 95）",
+      col_match("合同到期月份", "终止状态")[0] < 70)
+check("列名：截止日期 ↔ 截至日期 判同义（95）", col_match("截止日期", "截至日期")[0] >= 95)
+_KSRC = pd.DataFrame({"合同到期月份": ["2026-05", "2026-06", "2026-07", "2026-08", "2026-09", "2026-10"],
+                      "终止状态": ["未终止"] * 6, "值": ["v1", "v2", "v3", "v4", "v5", "v6"]})
+_tM = pd.DataFrame({"钥匙": ["2026-05"], "合同到期月份": [""], "值": [""]})
+_sM = pd.DataFrame({"钥匙": ["2026-05"], "合同到期月份": ["2026-05"], "终止状态": ["未终止"], "值": ["X"]})
+_rM = fill_multi(_tM, key_cols=["钥匙"], sources=[{"name": "m", "df": _sM}])
+check("类型守卫：日期类目标列不会被状态列(未终止)顶上",
+      str(_rM["result"]["合同到期月份"].iloc[0]) == "2026-05")
+
+# --- 回归：日期归一化（时间戳零点 → 只留日期）---
+_tN = pd.DataFrame({"钥匙": ["k1"], "截止日期": [""]})
+_sN = pd.DataFrame({"钥匙": ["k1"], "截止日期": [pd.Timestamp("2026-11-30")]})
+_rN = fill_multi(_tN, key_cols=["钥匙"], sources=[{"name": "n", "df": _sN}])
+check("日期归一化：2026-11-30 00:00:00 → 2026-11-30",
+      str(_rN["result"]["截止日期"].iloc[0]) == "2026-11-30")
+
+# --- 回归：第1轮歧义 → 第2轮被填上 → 不能再算歧义/不能出负数 ---
+_tO = pd.DataFrame({"钥匙": ["P1"], "甲": [""], "乙": [""]})
+_sO1 = {"name": "O1", "df": pd.DataFrame({"钥匙": ["P1"], "甲": ["only"]})}
+_sO2 = {"name": "O2", "df": pd.DataFrame({"钥匙": ["P1", "P1"], "甲": ["only", "x"],
+                                          "乙": ["d1", "d2"]})}
+_rO = fill_multi(_tO, key_cols=["钥匙"], sources=[_sO1, _sO2])
+_rv = _rO["stats"]
+check("级联：第1轮歧义的格第2轮被填上 → 歧义格 0、留空不为负",
+      str(_rO["result"]["乙"].iloc[0]) == "d1" and _rv["歧义格数"] == 0
+      and _rv["未匹配(留空)"] >= 0 and _rv["留空合计"] >= 0)
+check("统计自检：完全匹配+高+中+低+未匹配+歧义 == 行数×目标列数",
+      (_rv["完全匹配(100%)"] + _rv["高置信(80-99%)"] + _rv["中置信(40-80%)"]
+       + _rv["低置信(20-40%)"] + _rv["未匹配(留空)"] + _rv["歧义格数"])
+      == _rv["模板行数"] * _rv["目标列数"])
 
 # --- 上限：每张源表最多 4 把钥匙（你点 5 列也只取前 4）---
 _tH = pd.DataFrame({f"k{i}": ["v"] for i in range(1, 6)})
@@ -289,13 +320,17 @@ check("上限：fill_multi 里钥匙列也截到 4",
       len(fill_multi(_tH, key_cols=[f"k{i}" for i in range(1, 6)],
                      sources=[{"name": "sH", "df": _sH}])["key_pairs"][0]) <= 4)
 
-# --- 清单导出：写成第二个 Sheet「需人工确认」---
+# --- 清单导出：Sheet2「需人工确认」，复验明细单独一个 Sheet ---
 _rI = _rK2
 _pI = os.path.join(os.path.dirname(TMP), "fill_review.xlsx")
-export_filled(_rI["result"], _rI["confidence"], _pI, stats=_rI["stats"], review_df=_rI["review"])
+export_filled(_rI["result"], _rI["confidence"], _pI, stats=_rI["stats"],
+              review_df=_rI["review"], audit_df=_rI["audit"])
 _wbI = load_workbook(_pI)
-check("清单导出：有「需人工确认」Sheet 且列名齐全",
+check("清单导出：Sheet2「需人工确认」列名齐全（类型/行号/列名）",
       "需人工确认" in _wbI.sheetnames
-      and [c.value for c in _wbI["需人工确认"][1]][:4] == ["优先级", "类型", "行号", "列名"])
+      and [c.value for c in _wbI["需人工确认"][1]][:4] == ["类型", "行号", "列名", "钥匙值"])
+check("清单导出：复验明细写在「复验存疑」Sheet（不混进主清单）",
+      "复验存疑" in _wbI.sheetnames
+      and [c.value for c in _wbI["复验存疑"][1]][:2] == ["行号", "列名"])
 
 print(f"\n===== 多表补全测试通过：{ok} 项断言（离线）=====")

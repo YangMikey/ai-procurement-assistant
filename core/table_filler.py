@@ -35,8 +35,11 @@ KEY_MIN = 20.0          # 低于此分视为"未匹配"（留空+红）
 COL_DEFAULT_THRESHOLD = 70.0
 
 # ---------- 列名同义词族（先内置几组常见；后续可由经验库扩充） ----------
+# 注意：「到期/截止/截至」是**日期口径**，「终止/失效」是**状态口径** —— 绝不能算一族
+#（曾因此把"合同到期月份"配到源表"终止状态"，把「未终止」填进月份列）
 SYNONYM_GROUPS = [
-    ("截止", "结束", "到期", "终止"),
+    ("截止", "截至", "结束", "到期"),
+    ("终止", "失效", "作废"),
     ("金额", "总价", "总金额", "合价"),
     ("单价", "价格", "报价", "价"),
     ("编号", "编码", "单号", "号码"),
@@ -127,6 +130,46 @@ def _uniq_vals(series, limit=800):
 DOMAIN_MIN_UNIQ = 5        # 值域指纹：两边唯一值至少这么多才敢认
 DOMAIN_COVER = 0.8         # 值域指纹：双向覆盖率门槛
 
+# 日期/月份口径的列名特征 & 取值特征（类型守卫用）
+_DATE_NAME_KWS = ("日期", "时间", "月份", "月度", "到期", "截止", "截至", "起始", "开始", "年", "月")
+_DATE_VAL_RE = re.compile(
+    r"^(\d{4}[-/.]\d{1,2}([-/.]\d{1,2})?"          # 2026-05 / 2026-05-15 / 2026.5
+    r"|\d{4}\s*年\s*\d{1,2}\s*月(\s*\d{1,2}\s*日)?)?"  # 2026年5月 / 2026年5月15日
+    r"$")
+
+
+def _name_looks_date(name):
+    n = norm_col(name)
+    return any(k in n for k in _DATE_NAME_KWS)
+
+
+def _looks_date_col(series, min_vals=5, need=0.5):
+    """源列取值是否"像日期/月份"：返回 (是否达标, 像日期的比例)。
+
+    值太少（<min_vals）时不敢判 → 视为达标（放行，保持旧行为）。
+    """
+    import datetime as _dt
+    vals = []
+    try:
+        it = series.tolist()
+    except Exception:
+        it = list(series)
+    for v in it:
+        if not _has_value(v):
+            continue
+        vals.append(v)
+    if len(vals) < min_vals:
+        return True, 1.0
+    good = 0
+    for v in vals:
+        if isinstance(v, (_dt.date, _dt.datetime)):
+            good += 1
+            continue
+        if _DATE_VAL_RE.match(str(v).strip()):
+            good += 1
+    frac = good / len(vals)
+    return frac >= need, frac
+
 
 def value_domain_sim(tpl_series, src_series, min_uniq=DOMAIN_MIN_UNIQ, cover=DOMAIN_COVER):
     """值域指纹：列名对不上，但两列取值集合双向高度重叠 → 认定"同一类列"。
@@ -147,8 +190,16 @@ def value_domain_sim(tpl_series, src_series, min_uniq=DOMAIN_MIN_UNIQ, cover=DOM
 
 def pair_col(tpl_col, src_col, tpl_series=None, src_series=None,
              threshold=COL_DEFAULT_THRESHOLD, allow_domain=True):
-    """列配对：先列名（同名/同义/近似）→ 不达标再试**值域指纹**（方式标「值域」）。"""
+    """列配对：先列名（同名/同义/近似）→ 不达标再试**值域指纹**（方式标「值域」）。
+
+    类型守卫：目标列名是**日期/月份口径**时，源列取值必须"像日期/月份"，
+    否则判冲突 —— 防「合同到期月份 ← 终止状态（未终止）」这类误配。
+    """
     sc, how = col_match(tpl_col, src_col, threshold)
+    if sc < threshold and how != "冲突" and _name_looks_date(tpl_col) and src_series is not None:
+        ok, frac = _looks_date_col(src_series)
+        if not ok:
+            return 0.0, "冲突"
     if sc >= threshold:
         return sc, how
     if how == "冲突":                      # 含税/级别这类语义冲突：不给兜底
@@ -194,6 +245,20 @@ def _has_value(v):
         return not pd.isna(v)
     except Exception:
         return True
+
+
+def _norm_value(v):
+    """入库前归一化：日期时间戳若"零点"→ 只留日期（避免 2026-11-30 00:00:00 这种显示）。"""
+    import datetime as _dt
+    try:
+        if isinstance(v, pd.Timestamp):
+            v = v.to_pydatetime()
+        if isinstance(v, _dt.datetime) and v.hour == 0 and v.minute == 0 and v.second == 0 \
+                and v.microsecond == 0:
+            return v.date()
+    except Exception:
+        return v
+    return v
 
 
 def _band(score):
@@ -564,7 +629,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     # 折减按**跳数**：只用原值钥匙 → 不折减；用了补出来的值 → 每跳 ×0.9
                     g = max((gen.get((i, tk), 0) for tk in used_tks), default=0)
                     decayed = sc * (0.9 ** g)
-                    result.at[i, tcol] = v
+                    result.at[i, tcol] = _norm_value(v)
+                    tie_cells.pop((i, tcol), None)     # 之前判过"多候选"的格，这轮补上了 → 撤掉标记
                     filled[(i, tcol)] = (decayed, 0, k_used, tie_n)   # 轮次稍后回填
                     gen[(i, tcol)] = g + 1
                     n_fill[_band(decayed)] += 1
@@ -598,8 +664,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                 n_fill["miss"] += 1
 
     indirect = sum(1 for _, (_, rr, _, _) in filled.items() if rr > 1)
-    ambiguous = len(tie_cells)                  # 命中多行取值不同、已留空待人工选
-    n_blank = n_fill["miss"] - ambiguous        # 纯"源表没有"的留空
+    ambiguous = len(tie_cells)                  # 命中多行取值不同、最终仍留空待人工选
+    n_blank = max(0, n_fill["miss"] - ambiguous)   # 纯"源表没有"的留空（护栏：不得为负）
 
     # ---- 复验：只用"同一语义的降级对照"（少用一把 / 退到单钥匙），不抽无关列 ----
     audit = {"组数": 0, "可比格": 0, "不一致": []}
@@ -647,29 +713,30 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     n_diff = len(audit["不一致"])
     consistency = (1.0 - n_diff / n_cmp) if n_cmp else 1.0
 
-    # ---- 需人工确认清单：必看（多候选/未补上）在前，建议看（复验）在后 ----
+    # ---- 需人工确认清单：只收「必看」（多候选留空 / 未补上）----
+    # 「复验不一致」本质是"少一把钥匙→配到别的行"的预期差异，对用户没有可执行动作 →
+    # 不进主清单，只留质量分 + 明细（audit_detail，页面折叠/导出第三个 Sheet）
     review = []
     for (i, tcol), (tn, k_used, _how) in tie_cells.items():
-        review.append({"优先级": "必看", "类型": f"多候选(已留空,{tn}行取值不同)",
-                       "行号": i + 2, "列名": tcol,
-                       "钥匙值": _row_key_text(template_df, i, key_pairs),
-                       "主结果": "", "复验结果": ""})
+        review.append({"类型": f"多候选(已留空,{tn}行取值不同)", "行号": i + 2, "列名": tcol,
+                       "钥匙值": _row_key_text(template_df, i, key_pairs), "主结果": ""})
     for i in template_df.index:
         for tcol in target_cols:
             if (i, tcol) in tie_cells:
                 continue
             if not _has_value(result.at[i, tcol]) and not _has_value(template_df.at[i, tcol]):
-                review.append({"优先级": "必看", "类型": "未补上", "行号": i + 2, "列名": tcol,
-                               "钥匙值": _row_key_text(template_df, i, key_pairs),
-                               "主结果": "", "复验结果": ""})
-    for d in audit["不一致"]:
-        review.append({"优先级": "建议看", "类型": "复验不一致", **d})
-    _rev_cols = ["优先级", "类型", "行号", "列名", "钥匙值", "主结果", "复验结果"]
+                review.append({"类型": "未补上", "行号": i + 2, "列名": tcol,
+                               "钥匙值": _row_key_text(template_df, i, key_pairs), "主结果": ""})
+    _rev_cols = ["类型", "行号", "列名", "钥匙值", "主结果"]
     if review:
-        review.sort(key=lambda r: (0 if r.get("优先级") == "必看" else 1, r.get("行号", 0)))
+        review.sort(key=lambda r: (0 if str(r.get("类型", "")).startswith("多候选") else 1,
+                                   r.get("行号", 0), str(r.get("列名", ""))))
         review_df = pd.DataFrame(review, columns=_rev_cols)
     else:
         review_df = pd.DataFrame(columns=_rev_cols)
+    _aud_cols = ["行号", "列名", "钥匙值", "主结果", "复验结果"]
+    audit_df = pd.DataFrame(audit["不一致"], columns=_aud_cols) if audit["不一致"] \
+        else pd.DataFrame(columns=_aud_cols)
 
     # 每张源表实际用了哪几把钥匙（给界面显示）
     key_used_desc = [(sources[si]["name"],
@@ -691,7 +758,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
              "未补全行数": int((conf[target_cols] == "miss").any(axis=1).sum()) if target_cols else 0}
     return {"result": result, "confidence": conf, "stats": stats,
             "supply": supply, "legend": legend_lines(stats), "key_pairs": key_pairs,
-            "review": review_df}
+            "review": review_df, "audit": audit_df}
 
 
 def _row_key_text(template_df, i, key_pairs):
@@ -741,6 +808,8 @@ def discover_supply(tpl_cols, sources, col_threshold=COL_DEFAULT_THRESHOLD, mapp
                     continue
                 score, how = col_match(tcol, col, col_threshold)
                 if score >= col_threshold and how != "冲突":
+                    if _name_looks_date(tcol) and not _looks_date_col(df[col])[0]:
+                        continue                      # 类型守卫：日期类目标列不吃状态/文本列
                     nonblank = int(df[col].notna().sum())
                     cands.append({"source": si, "col": col, "score": score, "how": how,
                                   "filled": nonblank})
@@ -754,8 +823,8 @@ def legend_lines(stats):
     """表格下方备注（只写图例 + 统计；不列来源表）。"""
     lines = [
         "─" * 30 + " 说明 " + "─" * 30,
-        "颜色图例：无色=完全匹配(100%)；浅黄=高置信(80–99%)；浅蓝=中置信(40–80%)；"
-        "浅紫=低置信(20–40%)；浅灰底空格=未匹配（留空）",
+        "颜色图例：无色=完全匹配(100%) 或 模板本来就有的值（工具没动）；浅黄=高置信(80–99%)；"
+        "浅蓝=中置信(40–80%)；浅紫=低置信(20–40%)；浅灰底空格=未匹配（留空）",
         f"统计：模板 {stats['模板行数']} 行 × 目标列 {stats['目标列数']}；"
         f"完全匹配 {stats['完全匹配(100%)']}，高置信 {stats['高置信(80-99%)']}，"
         f"中置信 {stats['中置信(40-80%)']}，低置信 {stats['低置信(20-40%)']}，"
@@ -772,13 +841,15 @@ def legend_lines(stats):
     if stats.get("复验组数"):
         extra.append(f"复验：另用「少一把钥匙」的降级对照跑了 {stats['复验组数']} 遍，"
                      f"可比 {stats.get('复验可比格', 0)} 格、一致率 {stats.get('复验一致率', 100)}%"
-                     f"（存疑 {stats.get('复验不一致格', 0)} 格 = 这格是靠多把钥匙才定下来的，见清单「建议看」）")
+                     f"（不一致 {stats.get('复验不一致格', 0)} 格属于「少钥匙→配到别的行」的预期差异，"
+                     f"明细在「复验存疑」Sheet，一般不用看）")
     if stats.get("需人工确认行数"):
-        extra.append(f"需人工确认：{stats['需人工确认行数']} 行（必看在前，清单在第二个 Sheet）")
+        extra.append(f"需人工确认：{stats['需人工确认行数']} 行（多候选留空 / 未补上，见第二个 Sheet）")
     return lines + extra
 
 
-def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, review_df=None):
+def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, review_df=None,
+                  audit_df=None):
     """写出带颜色的整合表 + 下方备注块（表头/列宽/冻结/筛选/数字格式由 theme 统一处理）。"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -818,6 +889,13 @@ def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, re
                 ws2.append(["" if (v is None or (not isinstance(v, str) and pd.isna(v))) else v
                             for v in row])
             _style(ws2, 1, highlight_min=False)
+        if audit_df is not None and len(audit_df):
+            ws3 = wb.create_sheet("复验存疑")
+            ws3.append([str(c) for c in audit_df.columns])
+            for _, row in audit_df.iterrows():
+                ws3.append(["" if (v is None or (not isinstance(v, str) and pd.isna(v))) else v
+                            for v in row])
+            _style(ws3, 1, highlight_min=False)
     except Exception:
         pass
     wb.save(out_path)

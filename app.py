@@ -66,7 +66,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.02"
+BUILD = "2026-09-15.03"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -1004,17 +1004,15 @@ elif mode == "多表补全":
             _st2 = _mfres["stats"]
             _nd = _st2.get("需人工确认行数", 0)
             _rv = _mfres["review"]
-            _must = int((_rv["优先级"] == "必看").sum()) if len(_rv) else 0
-            _sug = int((_rv["优先级"] == "建议看").sum()) if len(_rv) else 0
+            _ad = _mfres.get("audit")
             _amb = _st2.get("歧义格数", 0)
             st.markdown(
                 f"**结论**：{_st2['模板行数']} 行 → 补上 {_st2['完全匹配(100%)'] + _st2['高置信(80-99%)']} 格"
                 f"（完全匹配 {_st2['完全匹配(100%)']}、高置信 {_st2['高置信(80-99%)']}）；"
                 f"留空 {_st2.get('留空合计', _st2['未匹配(留空)'])} 格"
                 + (f"（其中 **{_amb} 格命中多行、取值不同 → 没猜，等你选一条**）" if _amb else "")
-                + f"；复验一致率 {_st2.get('复验一致率', 100)}% → **需人工看 {_nd} 行**"
-                + (f"（必看 {_must} / 建议看 {_sug}）" if _nd else ""))
-            with st.expander("看细节（分档 / 用了哪几把钥匙 / 图例）"):
+                + f"；复验一致率 {_st2.get('复验一致率', 100)}% → **需人工看 {_nd} 行**")
+            with st.expander("看细节（分档 / 用了哪几把钥匙 / 复验存疑 / 图例）"):
                 st.caption(f"高置信 {_st2['高置信(80-99%)']}｜中置信 {_st2['中置信(40-80%)']}｜"
                            f"低置信 {_st2['低置信(20-40%)']}｜有未补全格的行 {_st2['未补全行数']}｜"
                            f"级联轮数 {_st2.get('级联轮数', 1)}｜间接补全 {_st2.get('间接补全格数', 0)}｜"
@@ -1025,18 +1023,22 @@ elif mode == "多表补全":
                 for _nt2 in _st2.get("钥匙说明", []):
                     st.caption(f"· {_nt2}")
                 st.caption("颜色图例：" + "；".join([
-                    "无色=完全匹配(100%)", "浅黄=高置信(80–99%)", "浅蓝=中置信(40–80%)",
-                    "浅紫=低置信(20–40%)", "浅灰底空格=未匹配"]))
+                    "无色=完全匹配(100%)或模板原有值", "浅黄=高置信(80–99%)", "浅蓝=中置信(40–80%)",
+                    "浅紫=低置信(20–40%)", "浅灰底空格=未匹配（留空）"]))
+                if _ad is not None and len(_ad):
+                    st.caption(f"复验存疑明细 {len(_ad)} 格（本质是「少一把钥匙→配到别的行」的预期差异，"
+                               f"一般不用看；已在下载件的「复验存疑」Sheet）")
+                    st.dataframe(_ad, height=200, width="stretch")
             st.dataframe(_mfres["result"], height=420, width="stretch")
             if len(_mfres["review"]):
-                st.markdown(f"**需人工确认 {len(_mfres['review'])} 行**")
+                st.markdown(f"**需人工确认 {len(_mfres['review'])} 行**（多候选留空 / 未补上）")
                 st.dataframe(_mfres["review"], height=220, width="stretch")
             try:
                 os.makedirs(_OUT_DIR2, exist_ok=True)
                 _fn2 = f"多表补全_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
                 _out2 = os.path.join(_OUT_DIR2, _fn2)
                 export_filled(_mfres["result"], _mfres["confidence"], _out2, stats=_st2,
-                              review_df=_mfres["review"])
+                              review_df=_mfres["review"], audit_df=_mfres.get("audit"))
                 with open(_out2, "rb") as _fh2:
                     st.download_button("⬇️ 下载补全表（带颜色与备注）", _fh2.read(), file_name=_fn2,
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
