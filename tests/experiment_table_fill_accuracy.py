@@ -40,13 +40,13 @@ def _norm(v):
     return "".join(str(v).split()).lower()
 
 
-def _bench(pred_df, gt_lut, key_cols, label):
+def _bench(pred_df, gt_lut, key_cols, label, target="事业部"):
     """对比预测与人工答案：填了几格/对了几格/错了几格/留空几格。"""
     n_fill = n_hit = n_bad = n_blank = 0
     bad_rows = []
     for i in pred_df.index:
         key = tuple(_norm(pred_df.at[i, c]) for c in key_cols)
-        got = pred_df.at[i, "事业部"]
+        got = pred_df.at[i, target]
         want = gt_lut.get(key)
         if not str(got or "").strip():
             n_blank += 1
@@ -93,32 +93,45 @@ else:
 
     lines = [f"多表补全回测报告  {datetime.now():%Y-%m-%d %H:%M}", "=" * 44,
              f"模板：钥匙表_采购项目汇总 · Sheet1（{len(keys)} 行）",
-             f"目标列：事业部（空白，等补）；标准答案：{len(gt)} 行人工结果", ""]
+             f"标准答案：人工结果表（{len(gt)} 行）", ""]
 
-    # ---- 改前：只用「项目名称」一把钥匙（关掉自动配钥匙/延后/复验）----
-    tplA = keys[tkeys].copy()
-    tplA["事业部"] = ""
-    rA1 = fill_multi(tplA, key_cols=["项目名称"], sources=[{"name": "答案表", "df": ans}],
-                     auto_keys=False, defer_single=False, audit_rounds=0)
-    m1 = _bench(rA1["result"], gt, tkeys, "改前")
-    lines += [f"【改前】只用「项目名称」一把钥匙（旧行为）",
-              f"  填格 {m1['填格']}｜对 {m1['对']}｜错 {m1['错']}｜留空 {m1['留空']}"
-              f"｜歧义格 {rA1['stats']['歧义格数']}"]
-    for b in m1["错行"][:5]:
-        lines.append(f"    错：行{b[0]} {b[1]}/{b[2]} 填了 {b[3]}，应为 {b[4]}")
+    def _scenario(target, label):
+        """对比「改前(只用项目名称+猜第1条)」vs「改后(自动配钥匙+歧义留空)」。"""
+        g = {}
+        for _, r in ans.iterrows():
+            if str(r.get(target) or "").strip():
+                g[(_norm(r["项目名称"]), _norm(r["采购三级分类"]))] = r[target]
+        tpl = keys[tkeys].copy()
+        tpl[target] = ""
+        out = []
+        for tag, kw in (("改前", dict(auto_keys=False, defer_single=False, audit_rounds=0,
+                                      blank_on_tie=False)),
+                        ("改后", dict())):
+            r = fill_multi(tpl, key_cols=["项目名称"],
+                           sources=[{"name": "答案表", "df": ans}], **kw)
+            mm = _bench(r["result"], g, tkeys, tag, target)
+            out.append((tag, mm, r))
+        (t1, m1, r1), (t2, m2, r2) = out
+        lines.extend([
+            f"【{label}】目标列 = {target}",
+            f"  {t1}（只用「项目名称」一把钥匙，命中多行取第 1 条）："
+            f"填 {m1['填格']}｜对 {m1['对']}｜**错 {m1['错']}**｜留空 {m1['留空']}"
+            f"｜歧义格 {r1['stats']['歧义格数']}",
+            f"  {t2}（自动配「项目名称+采购三级分类」；命中多行取值不同 → 留空）："
+            f"填 {m2['填格']}｜对 {m2['对']}｜**错 {m2['错']}**｜留空 {m2['留空']}"
+            f"｜歧义格 {r2['stats']['歧义格数']}",
+            f"  实际钥匙列：{r2['stats']['实际钥匙列']}",
+            f"  需人工确认：必看 {int((r2['review']['优先级'] == '必看').sum())} 行，"
+            f"建议看 {int((r2['review']['优先级'] == '建议看').sum())} 行",
+            ""])
+        for b in m1["错行"][:5]:
+            lines.append(f"    {t1}错：行{b[0]} {b[1]}/{b[2]} 填了 {b[3]}，应为 {b[4]}")
+        return (t1, m1, r1), (t2, m2, r2)
 
-    # ---- 改后：只点「项目名称」，系统自动配第二把钥匙 + 延后 + 复验 ----
-    rA2 = fill_multi(tplA, key_cols=["项目名称"], sources=[{"name": "答案表", "df": ans}])
-    m2 = _bench(rA2["result"], gt, tkeys, "改后")
-    lines += ["", f"【改后】只点「项目名称」，系统自动配钥匙（自动/延后/复验全开）",
-              f"  填格 {m2['填格']}｜对 {m2['对']}｜错 {m2['错']}｜留空 {m2['留空']}"
-              f"｜歧义格 {rA2['stats']['歧义格数']}｜延后源表 {rA2['stats']['延后源表数']}"
-              f"｜复验一致率 {rA2['stats']['复验一致率']}%（可比 {rA2['stats']['复验可比格']} 格）",
-              f"  实际钥匙列：{rA2['stats']['实际钥匙列']}"]
-    for n in rA2["stats"]["钥匙说明"]:
-        lines.append(f"    · {n}")
-    for b in m2["错行"][:5]:
-        lines.append(f"    错：行{b[0]} {b[1]}/{b[2]} 填了 {b[3]}，应为 {b[4]}")
+    # A：只跟项目名挂钩的列（改前本来也不会错）
+    (_, mA1, _), (_, mA2, rA2) = _scenario("事业部", "A 只跟项目名挂钩的列")
+    # C：随分类变化的列（改前会错，这才是关键证据）
+    (_, mC1, rC1), (_, mC2, rC2) = _scenario("合同编号", "C 随三级分类变化的列")
 
     # ---- 场景 B：源表换成另一张真实表（列名叫「项目/类别」）----
     tplB = keys[tkeys].copy()
@@ -133,20 +146,23 @@ else:
     for b in mB["错行"][:5]:
         lines.append(f"    错：行{b[0]} {b[1]}/{b[2]} 填了 {b[3]}，应为 {b[4]}")
 
-    lines += ["", "结论：改后 = 自动找到第二把钥匙，把「重名多候选」行从'取第1条'变成'唯一定位'；",
-              "      余下留空的行 = 源表里确实没有（人工也补不上），已进「需人工确认」清单。"]
+    lines += ["", "结论：目标列只跟项目名挂钩时（场景A）改前本来就不会错；",
+              "      目标列随三级分类变化时（场景C）改前靠猜第 1 条 → 错值 14，改后自动配第二把钥匙 + 歧义留空 → 错值 0；",
+              "      余下留空 = 源表自身重复行（无解）或源表里确实没有，已进「需人工确认」清单（必看在前）。"]
     with open(REPORT, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
     check("回测：报告已生成", os.path.exists(REPORT))
-    check("回测：改前存在「重名多候选」行（歧义格 >0）", rA1["stats"]["歧义格数"] > 0)
-    check("回测：改后歧义格大幅减少（≤改前 1/3）",
-          rA2["stats"]["歧义格数"] <= max(1, rA1["stats"]["歧义格数"] // 3))
-    check("回测：改后自动补了第二把钥匙（说明非空）", len(rA2["stats"]["钥匙说明"]) > 0)
-    check("回测：改后错值 0 且比改前不差", m2["错"] == 0 and m2["错"] <= m1["错"])
-    check("回测：改后填格数 ≥ 改前（覆盖率不下降）", m2["填格"] >= m1["填格"])
-    check("回测：改后对齐人工答案的准确率 ≥ 95%",
-          m2["对"] >= 0.95 * max(1, m2["填格"]))
+    check("场景A（只跟项目名挂钩）：改前改后都不错（错 0）", mA1["错"] == 0 and mA2["错"] == 0)
+    check("场景C（随分类变化）：改前会填错（错 >0）", mC1["错"] > 0)
+    check("场景C：改后错值归零（靠自动配钥匙 + 歧义留空）", mC2["错"] == 0)
+    check("场景C：改后是靠自动补的第二把钥匙定下来的", len(rC2["stats"]["钥匙说明"]) > 0)
+    check("场景C：改后歧义格进清单（必看/多候选）",
+          rC2["stats"]["歧义格数"] > 0
+          and "多候选" in "".join(rC2["review"]["类型"].astype(str)))
+    check("场景C：清单排序必看在前",
+          list(rC2["review"]["优先级"]) == sorted(rC2["review"]["优先级"],
+                                                  key=lambda x: 0 if x == "必看" else 1))
     check("场景B：换一张真实表也能补上（自动认出「类别」）", n_fillB >= 5)
     check("场景B：对上人工答案的错值 ≤1 行", mB["错"] <= 1)
 

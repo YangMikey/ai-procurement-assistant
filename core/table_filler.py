@@ -236,20 +236,24 @@ def _auto_key_pairs(template_keys, source, col_threshold, legacy_key_col=None,
 
 
 def _combo_score(template_df, src, pairs, key_min):
-    """自检打分：用这组钥匙去试，返回 (歧义率, 覆盖率, 列数)；越靠前越优。"""
+    """自检打分：用这组钥匙去试，返回 (歧义率, 覆盖率, 列数)；越靠前越优。
+
+    探针列取"最有区分度、且不是钥匙列"的源列（否则拿钥匙列自己当探针 → 歧义永远测不出来）。
+    """
     if not pairs:
         return None
     df = src["df"]
-    tgt = None
+    used_src = {scol for _tk, scol, _s in pairs}
+    tgt, best_u = None, -1
     for c in df.columns:
-        if c == src.get("key_col"):
+        if c in used_src or c == src.get("key_col"):
             continue
         try:
-            if df[c].notna().any():
-                tgt = c
-                break
+            u = int(df[c].nunique(dropna=True))
         except Exception:
             continue
+        if u > best_u:
+            best_u, tgt = u, c
     if tgt is None:
         return None
     idx_cache = {}
@@ -354,17 +358,23 @@ def plan_keys(template_df, key_candidates, sources, user_keys=(), mapping=None,
     return {"per_source": per_source, "notes": notes}
 
 
-def _pick_row(rows, df, target_col, score, k, exact):
-    """并列多行的处理：目标值相同→直接用；不同→取第1条并降档（标歧义）。"""
+def _pick_row(rows, df, target_col, score, k, exact, blank_on_tie=False):
+    """并列多行的处理。
+
+    - 取值相同 → 直接用第 1 条（不算歧义）
+    - 取值不同 → tie_n>0；blank_on_tie=True 时返回 row=None（**留空交给人工，不猜**）
+    """
     if len(rows) == 1:
         return rows[0], score, k, 0, exact
     vals = [df[target_col].iloc[j] if target_col in df.columns else None for j in rows]
     first = vals[0]
     same = all((pd.isna(a) and pd.isna(first)) or (a == first) for a in vals)
-    return rows[0], (score if same else min(score, 39.0)), k, len(rows), exact
+    if same:
+        return rows[0], score, k, 0, exact
+    return (None if blank_on_tie else rows[0]), min(score, 39.0), k, len(rows), exact
 
 
-def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache):
+def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on_tie=False):
     """按"钥匙层次 n→1"在源表里找最佳行；层内先精确（索引）后模糊。
 
     pairs: [(模板钥匙列, 源列, 列名匹配度)]（按模板钥匙列顺序）
@@ -390,7 +400,7 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache):
             idx_cache[ck] = idx
         rows = idx.get(want, [])
         if rows:
-            return _pick_row(rows, df, target_col, 100.0, k, True)
+            return _pick_row(rows, df, target_col, 100.0, k, True, blank_on_tie)
         best_score, best_rows = 0.0, []
         for j in range(len(df)):
             vals = [norm_text(df[c].iloc[j]) for _, c in sub]
@@ -405,7 +415,7 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache):
             elif abs(sc - best_score) <= 1e-9:
                 best_rows.append(j)
         if best_rows and best_score >= key_min:
-            return _pick_row(best_rows, df, target_col, best_score, k, False)
+            return _pick_row(best_rows, df, target_col, best_score, k, False, blank_on_tie)
     return None
 
 
@@ -426,14 +436,16 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                col_threshold=COL_DEFAULT_THRESHOLD, key_min=KEY_MIN,
                key_cols=None, max_rounds=MAX_ROUNDS, promote_min=PROMOTE_MIN,
                auto_keys=True, defer_single=True, audit_rounds=2, audit_seed=42,
-               allow_domain=True, key_plan=None, _audit=False, max_keys=4):
+               allow_domain=True, key_plan=None, _audit=False, max_keys=4,
+               blank_on_tie=True):
     """多源 → 模板 单向填充（自动配钥匙 + 分层钥匙 + 级联 + 复验）。
 
     - 模板钥匙列 ≤4 个（你点的列优先；不够时自动按"歧义率低→覆盖率高→列数少"补位）
     - 源表钥匙自动配对：列名（同名/同义/近似）→ 不达标再试**值域指纹**
     - 单钥匙源表：第 1 轮整表延后，第 2 轮起能凑到 ≥2 把就用复合钥匙，仍只有 1 把就按 1 把匹配
     - 级联：最多 max_rounds 轮，某轮无新增即停；补出的值 ≥ promote_min 才可当钥匙（×0.9/跳）
-    - 复验：另外随机换 1~2 组钥匙列再跑一遍，两次取值不一致的格进「需人工确认」清单
+    - 复验：另外用「少一把钥匙」的降级对照再跑一遍，定不出来/取值不同的格进「需人工确认」清单
+    - blank_on_tie=True（默认）：命中多行且取值不同 → **留空**交人工（不猜第 1 条）
     """
     sources = list(sources or [])
     mapping = mapping or {}
@@ -476,6 +488,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     n_fill = {"ok": 0, "high": 0, "mid": 0, "low": 0, "miss": 0}
     eff_rounds = 0       # 有效轮数 = 真正补出东西的轮数（"延后"不占轮）
     deferred_sources = set()
+    tie_cells = {}       # (i, col) -> (tie_n, k_used, how)：命中多行取值不同 → 留空待人工选
 
     for r in range(1, int(max_rounds) + 1):
         # 本轮开始快照"可用钥匙"（本轮新补出的值下一轮才生效 → 级联逐轮推进、轮次可解释）
@@ -517,6 +530,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                 if not row_vals:
                     continue
                 best = None
+                tie_info = None
                 for si in active:
                     s = sources[si]
                     # 匹配用钥匙：本行可得 & 不是"目标列自己"（防自引用）
@@ -530,10 +544,15 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                         ccol = cand["col"]
                         if ccol not in s["df"].columns:
                             continue
-                        m = _match_source(s, pairs, row_vals, key_min, ccol, idx_cache)
+                        m = _match_source(s, pairs, row_vals, key_min, ccol, idx_cache,
+                                          blank_on_tie=blank_on_tie)
                         if not m:
                             continue
                         j, sc, k_used, tie_n, exact = m
+                        if j is None:              # 命中多行且取值不同 → 不猜，记下来
+                            if tie_info is None or tie_n > tie_info[0]:
+                                tie_info = (tie_n, k_used, cand["how"])
+                            continue
                         v = s["df"][ccol].iloc[j]
                         if not _has_value(v):
                             continue
@@ -551,6 +570,9 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     n_fill[_band(decayed)] += 1
                     round_fills.append((i, tcol, decayed, k_used, tie_n))
                     progressed = True
+                elif tie_info is not None:
+                    # 有几条候选但取值不同 → 宁可留空，交人工选（清单里写「多候选(已留空)」）
+                    tie_cells[(i, tcol)] = tie_info
 
         if progressed:
             eff_rounds += 1
@@ -576,31 +598,30 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                 n_fill["miss"] += 1
 
     indirect = sum(1 for _, (_, rr, _, _) in filled.items() if rr > 1)
-    ambiguous = sum(1 for _, (_, _, _, tie) in filled.items() if tie)
+    ambiguous = len(tie_cells)                  # 命中多行取值不同、已留空待人工选
+    n_blank = n_fill["miss"] - ambiguous        # 纯"源表没有"的留空
 
-    # ---- 复验：随机换钥匙列组合再跑一遍，两次取值不一致的格 → 人工清单 ----
+    # ---- 复验：只用"同一语义的降级对照"（少用一把 / 退到单钥匙），不抽无关列 ----
     audit = {"组数": 0, "可比格": 0, "不一致": []}
     if audit_rounds and not _audit:
-        import random
-        rng = random.Random(int(audit_seed or 0))
-        pool_all = [_auto_key_pairs(list(key_candidates), s, col_threshold, s.get("key_col"),
-                                    template_df, allow_domain) for s in sources]
-        for a in range(int(audit_rounds)):
-            alt = []
+        alt_plans, seen_alt = [], set()
+        for kind in ("drop_last", "single", "drop_first"):
+            per, changed = [], False
             for si in range(len(sources)):
                 main = key_pairs[si]
-                main_tks = {p[0] for p in main}
-                others = [p for p in pool_all[si] if p[0] not in main_tks]
-                alts = []
-                if len(main) >= 2:                       # ① 少用一把钥匙
-                    alts.append(main[:-1])
-                if len(others) >= 2:                     # ② 换成池里另外两把
-                    alts.append(rng.sample(others, 2))
-                elif others:                             # ③ 换成池里另一把
-                    alts.append([others[0]])
-                if main:
-                    alts.append(main[:1])                # ④ 退到单钥匙
-                alt.append(alts[a % len(alts)] if alts else main)
+                if kind == "drop_last" and len(main) >= 2:
+                    per.append(main[:-1]); changed = True
+                elif kind == "drop_first" and len(main) >= 3:
+                    per.append(main[1:]); changed = True
+                elif kind == "single" and len(main) >= 2:
+                    per.append(main[:1]); changed = True
+                else:
+                    per.append(main)
+            key = tuple(tuple((p[0], p[1]) for p in pr) for pr in per)
+            if changed and key not in seen_alt:
+                seen_alt.add(key)
+                alt_plans.append(per)
+        for alt in alt_plans[:max(0, int(audit_rounds))]:
             try:
                 r2 = fill_multi(template_df, key_cols=tkeys, sources=sources, mapping=mapping,
                                 col_threshold=col_threshold, key_min=key_min,
@@ -615,33 +636,40 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
             for tcol in target_cols:
                 for i in template_df.index:
                     a1, a2 = result.at[i, tcol], res2.at[i, tcol]
-                    if _has_value(a1) and _has_value(a2):
-                        audit["可比格"] += 1
-                        if norm_text(a1) != norm_text(a2):
-                            audit["不一致"].append({"行号": i + 2, "列名": tcol,
-                                                    "钥匙值": _row_key_text(template_df, i, key_pairs),
-                                                    "主结果": a1, "复验结果": a2})
+                    if not _has_value(a1) or not _has_value(a2):
+                        continue          # 降级后"定不出来"不是问题（说明第二把钥匙在起作用）
+                    audit["可比格"] += 1
+                    if norm_text(a1) != norm_text(a2):
+                        audit["不一致"].append({"行号": i + 2, "列名": tcol,
+                                                "钥匙值": _row_key_text(template_df, i, key_pairs),
+                                                "主结果": a1, "复验结果": a2})
     n_cmp = audit["可比格"]
     n_diff = len(audit["不一致"])
     consistency = (1.0 - n_diff / n_cmp) if n_cmp else 1.0
 
-    # ---- 需人工确认清单（3 类：留空 / 复验不一致 / 多候选）----
+    # ---- 需人工确认清单：必看（多候选/未补上）在前，建议看（复验）在后 ----
     review = []
-    for d in audit["不一致"]:
-        review.append({"类型": "复验不一致", **d})
+    for (i, tcol), (tn, k_used, _how) in tie_cells.items():
+        review.append({"优先级": "必看", "类型": f"多候选(已留空,{tn}行取值不同)",
+                       "行号": i + 2, "列名": tcol,
+                       "钥匙值": _row_key_text(template_df, i, key_pairs),
+                       "主结果": "", "复验结果": ""})
     for i in template_df.index:
         for tcol in target_cols:
+            if (i, tcol) in tie_cells:
+                continue
             if not _has_value(result.at[i, tcol]) and not _has_value(template_df.at[i, tcol]):
-                review.append({"类型": "未补上", "行号": i + 2, "列名": tcol,
+                review.append({"优先级": "必看", "类型": "未补上", "行号": i + 2, "列名": tcol,
                                "钥匙值": _row_key_text(template_df, i, key_pairs),
                                "主结果": "", "复验结果": ""})
-    for (i, tcol), (_sc, _rr, _k, tie) in filled.items():
-        if tie:
-            review.append({"类型": "多候选", "行号": i + 2, "列名": tcol,
-                           "钥匙值": _row_key_text(template_df, i, key_pairs),
-                           "主结果": result.at[i, tcol], "复验结果": ""})
-    review_df = pd.DataFrame(review, columns=["类型", "行号", "列名", "钥匙值", "主结果", "复验结果"]) \
-        if review else pd.DataFrame(columns=["类型", "行号", "列名", "钥匙值", "主结果", "复验结果"])
+    for d in audit["不一致"]:
+        review.append({"优先级": "建议看", "类型": "复验不一致", **d})
+    _rev_cols = ["优先级", "类型", "行号", "列名", "钥匙值", "主结果", "复验结果"]
+    if review:
+        review.sort(key=lambda r: (0 if r.get("优先级") == "必看" else 1, r.get("行号", 0)))
+        review_df = pd.DataFrame(review, columns=_rev_cols)
+    else:
+        review_df = pd.DataFrame(columns=_rev_cols)
 
     # 每张源表实际用了哪几把钥匙（给界面显示）
     key_used_desc = [(sources[si]["name"],
@@ -652,8 +680,9 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
              "可填格": len(template_df) * len(target_cols),
              "完全匹配(100%)": n_fill["ok"], "高置信(80-99%)": n_fill["high"],
              "中置信(40-80%)": n_fill["mid"], "低置信(20-40%)": n_fill["low"],
-             "未匹配(留空)": n_fill["miss"],
+             "未匹配(留空)": n_blank,
              "级联轮数": rounds_used, "间接补全格数": indirect, "歧义格数": ambiguous,
+             "留空合计": n_fill["miss"],
              "延后源表数": len(deferred_sources),
              "复验组数": audit["组数"], "复验可比格": n_cmp, "复验不一致格": n_diff,
              "复验一致率": round(consistency * 100, 1),
@@ -737,15 +766,15 @@ def legend_lines(stats):
     if stats.get("间接补全格数"):
         extra.append(f"含 {stats['间接补全格数']} 格为多轮间接补全（置信已按跳数折减）")
     if stats.get("歧义格数"):
-        extra.append(f"有 {stats['歧义格数']} 格命中多行且取值不同，已取第 1 条，请核对")
+        extra.append(f"有 {stats['歧义格数']} 格命中多行且取值不同 → **已留空**（见「需人工确认」清单，选一条填）")
     if stats.get("延后源表数"):
         extra.append(f"有 {stats['延后源表数']} 张源表第 1 轮延后（只有 1 把钥匙，等后续轮次凑第二把）")
     if stats.get("复验组数"):
-        extra.append(f"复验：另换 {stats['复验组数']} 组钥匙列跑了一遍，"
+        extra.append(f"复验：另用「少一把钥匙」的降级对照跑了 {stats['复验组数']} 遍，"
                      f"可比 {stats.get('复验可比格', 0)} 格、一致率 {stats.get('复验一致率', 100)}%"
-                     f"（不一致 {stats.get('复验不一致格', 0)} 格，见「需人工确认」清单）")
+                     f"（存疑 {stats.get('复验不一致格', 0)} 格 = 这格是靠多把钥匙才定下来的，见清单「建议看」）")
     if stats.get("需人工确认行数"):
-        extra.append(f"需人工确认：{stats['需人工确认行数']} 行（清单见第二个 Sheet）")
+        extra.append(f"需人工确认：{stats['需人工确认行数']} 行（必看在前，清单在第二个 Sheet）")
     return lines + extra
 
 
