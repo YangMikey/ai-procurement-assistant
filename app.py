@@ -32,6 +32,7 @@ from core.excel_io import (backup_sheet_numbered, detect_header_block_bottom,
                            write_result_in_sheet, writeback_convert)
 from core.converter import convert_tax, parse_rate, parse_rate_from_name
 from core.experience import ExperienceStore
+from core.conventions import ConventionStore
 from core.highlighter import PRESETS, export_highlighted
 from core.llm_client import (CACHE_PATH as LLM_CACHE_PATH, DEFAULT_MODEL,
                              LLMClient, PROVIDER_PRESETS, load_config, save_config)
@@ -67,7 +68,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.05"
+BUILD = "2026-09-15.06"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -139,6 +140,7 @@ with st.sidebar.expander("🧩 技能注册表（V2 意图路由地基）"):
              for c in list_skills()}, expanded=False)
 
 store = ExperienceStore()
+conv_store = ConventionStore()      # 口径本（列级结论 + 值等价 + 人工裁决）
 _llm_client = LLMClient()      # 读 data/llm_config.json（默认关，不发请求）
 
 UP_TYPES = ["xlsx", "xlsm", "xls", "csv"]
@@ -173,6 +175,23 @@ with st.sidebar.expander("🤖 LLM（可选 · 默认关）", expanded=False):
         except Exception:
             st.caption("无缓存可清")
     st.caption("缓存 data/llm_cache.json · 调用日志 logs/llm.log · 单次运行有调用上限")
+
+with st.sidebar.expander(f"📘 口径本（{sum(conv_store.stats().values())} 条 · 越用越厚）"):
+    st.caption("列级结论 + 值等价（如 1事业部 = 一、广州科汇 = 科汇）：命中就自动沿用；"
+               "**证不出来的一律不自动采用**，下次直接问。")
+    _cv_items = conv_store.list_items()
+    if _cv_items:
+        for _it in _cv_items[-10:]:
+            if "mapping" in _it:
+                st.caption(f"· [{_it.get('scope')}] " + "、".join(
+                    f"{k}={v}" for k, v in list(_it["mapping"].items())[:4]))
+            else:
+                st.caption(f"· {_it.get('q')} → {_it.get('a')}")
+    else:
+        st.caption("（还是空的：跑一次之后，新学到的口径会攒在这里）")
+    if st.button("清空口径本", key="conv_clear"):
+        conv_store.clear()
+        st.success("已清空口径本")
 
 with st.sidebar.expander(f"🧠 经验库（{len(store.pairs)} 条）"):
     st.caption("人工确认沉淀、**兜底**用（精确/模糊都配不上时才生效）；可随时删除/清空。")
@@ -1024,10 +1043,10 @@ elif mode == "多表补全":
                     _res2 = fill_multi(_tpl_df, key_cols=_tkeys, sources=_sources,
                                        mapping=_mapping2, col_threshold=float(_thr2),
                                        key_min=float(_kmin2), max_rounds=int(_rnd2),
-                                       promote_min=float(_pmin2), auto_keys=bool(_autok2),
-                                       defer_single=bool(_def2), audit_rounds=int(_aud2),
-                                       audit_seed=int(_seed2), allow_domain=bool(_dom2),
-                                       experience=store)
+                                    promote_min=float(_pmin2), auto_keys=bool(_autok2),
+                                    defer_single=bool(_def2), audit_rounds=int(_aud2),
+                                    audit_seed=int(_seed2), allow_domain=bool(_dom2),
+                                    experience=store, conventions=conv_store)
                 st.session_state["mf_res"] = _res2
             except Exception as e:
                 log_exception("多表补全失败", e)
@@ -1050,6 +1069,8 @@ elif mode == "多表补全":
             _nmiss = _st2.get("未匹配(留空)", 0)
             _ncmp = _st2.get("两源可核对格", 0)
             _nbad = _st2.get("两源矛盾格", 0)
+            _ncomp = _st2.get("互补格数", 0)
+            _blocked = _st2.get("拒绝互补列") or []
             st.markdown(
                 f"**结论**：{_st2['模板行数']} 行 × {_st2['目标列数']} 列 → "
                 f"**100% 精确 {_st2['完全匹配(100%)']} 格**"
@@ -1057,6 +1078,8 @@ elif mode == "多表补全":
                 + (f"｜**非 100% {_n100} 格**（浅黄/浅蓝/浅紫，已在抽查区列出）" if _n100 else "｜无非100%格")
                 + f"｜留空 {_st2.get('留空合计', 0)}（待你选 {_amb}／源表缺 {_nmiss}）"
                 + (f"｜**两源交叉核对：{_ncmp} 格可比、矛盾 {_nbad}**" if _ncmp else "")
+                + (f"｜拒绝互补 {len(_blocked)} 列（两表口径不同，不硬补）" if _blocked else "")
+                + (f"｜互补 {_ncomp} 格" if _ncomp else "")
                 + (f" → **需你处理 {_nd} 格（涉及 {_nd_rows} 行）**" if _nd else ""))
             st.dataframe(_mfres["result"], height=420, width="stretch")
 
@@ -1121,6 +1144,13 @@ elif mode == "多表补全":
                 st.caption("颜色图例：" + "；".join([
                     "无色=完全匹配(100%)或模板原有值", "浅黄=高置信(80–99%)", "浅蓝=中置信(40–80%)",
                     "浅紫=低置信(20–40%)", "浅灰底空格=未匹配（留空）"]))
+                for _b in _blocked:
+                    st.caption("🚧 " + _b)
+                for _q in (_st2.get("口径说明") or []):
+                    st.caption("· 值等价：" + _q)
+                _cst = conv_store.stats()
+                st.caption(f"📘 口径本：列级结论 {_cst['列级结论']} 条、值等价 {_cst['值等价组']} 组、"
+                           f"人工裁决 {_cst['人工裁决']} 条（越用越厚，可清空）")
             try:
                 os.makedirs(_OUT_DIR2, exist_ok=True)
                 _fn2 = f"多表补全_{_dt.now():%Y%m%d_%H%M%S}.xlsx"

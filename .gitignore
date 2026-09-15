@@ -25,3 +25,4 @@ desktop.ini
 .streamlit/secrets.toml
 *.pem
 *.key
+data/conventions.json

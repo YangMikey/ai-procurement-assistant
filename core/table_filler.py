@@ -18,7 +18,10 @@ import re
 
 import pandas as pd
 
-from .aligner import _name_sim, norm_text
+from .aligner import _bag_sim, _name_sim, norm_text
+from .conventions import agreement as _agree_of
+from .conventions import canon as _canon
+from .conventions import learn_value_equiv as _learn_equiv
 from .registry import skill
 
 # ---------- 颜色档位（统一取主题语义色：高=浅黄 / 中=浅蓝 / 低=浅紫 / 缺失=浅灰） ----------
@@ -551,27 +554,30 @@ def _near_values(src, pairs, row_vals, target_col, lo=40.0, topn=3):
     return out
 
 
-def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on_tie=False):
+def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on_tie=False,
+                  norm_fn=None):
     """按"钥匙层次 n→1"在源表里找最佳行；层内先精确（索引）后模糊。
 
     pairs: [(模板钥匙列, 源列, 列名匹配度)]（按模板钥匙列顺序）
     row_vals: {模板钥匙列: 归一化值}（本行可用且达标的钥匙）
-    返回 (row, score, k_used, tie_n, all_exact) 或 None。
+    norm_fn: 归一化函数（默认 norm_text；传口径本的 canon/等价映射时，`1事业部`↔`一` 可精确命中）
+    返回 (row, score, k_used, tie_n, all_exact, rows) 或 None。
     """
+    nf = norm_fn or norm_text
     avail = [(tk, scol) for tk, scol, _ in pairs if row_vals.get(tk)]
     if not avail:
         return None
     df = src["df"]
     for k in range(len(avail), 0, -1):
         sub = avail[:k]
-        want = tuple(row_vals[tk] for tk, _ in sub)
-        ck = (id(df), tuple(scol for _, scol in sub))
+        want = tuple(nf(row_vals[tk]) for tk, _ in sub)
+        ck = (id(df), tuple(scol for _, scol in sub), getattr(nf, "_tag", "raw"))
         idx = idx_cache.get(ck)
         if idx is None:
             cols = [df[c].tolist() for _, c in sub]
             idx = {}
             for j in range(len(df)):
-                t = tuple(norm_text(c[j]) for c in cols)
+                t = tuple(nf(c[j]) for c in cols)
                 if all(t):
                     idx.setdefault(t, []).append(j)
             idx_cache[ck] = idx
@@ -580,7 +586,7 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on
             return _pick_row(rows, df, target_col, 100.0, k, True, blank_on_tie)
         best_score, best_rows = 0.0, []
         for j in range(len(df)):
-            vals = [norm_text(df[c].iloc[j]) for _, c in sub]
+            vals = [nf(df[c].iloc[j]) for _, c in sub]
             if not all(vals):
                 continue
             sims = [_key_sim(vals[x], want[x]) for x in range(k)]
@@ -614,7 +620,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                key_cols=None, max_rounds=MAX_ROUNDS, promote_min=PROMOTE_MIN,
                auto_keys=True, defer_single=True, audit_rounds=0, audit_seed=42,
                allow_domain=True, key_plan=None, _audit=False, max_keys=4,
-               blank_on_tie=True, experience=None):
+               blank_on_tie=True, experience=None, conventions=None):
     """多源 → 模板 单向填充（自动配钥匙 + 分层钥匙 + 级联 + 复验）。
 
     - 模板钥匙列 ≤4 个（你点的列优先；不够时自动按"歧义率低→覆盖率高→列数少"补位）
@@ -694,6 +700,116 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
             vals.append("" if not _has_value(v) else str(v))
         return exp_key_of(vals)
 
+    # ---- 口径本①：学"值等价"（1事业部 = 一 这类）→ 让钥匙能精确命中，而不是"75 分像" ----
+    n_equiv = 0
+    equiv_notes = []
+    if conventions is not None:
+        try:
+            for s in sources:
+                nm = s["name"]
+                for tk, scol, _cs in key_pairs[sources.index(s)]:
+                    if tk not in template_df.columns or scol not in s["df"].columns:
+                        continue
+                    r = _learn_equiv(template_df[tk].tolist(), s["df"][scol].tolist())
+                    if r.get("ok"):
+                        conventions.record_value_equiv([tk, nm], r["mapping"], src="auto",
+                                                       evidence=r.get("reason", ""))
+                        n_equiv += 1
+                        equiv_notes.append(f"{nm}「{scol}」↔ 模板「{tk}」：{r['reason']}")
+        except Exception:
+            pass
+
+    def _src_norm(src_name, tpl_cols):
+        """该源表的钥匙归一化：canon（去修饰词+数字互转）+ 该源表已学到的值等价。"""
+        alias = {}
+        if conventions is not None:
+            for tc in tpl_cols:
+                try:
+                    mp = conventions.value_mapping(tc, src_name) or {}
+                except Exception:
+                    mp = {}
+                for k, v in mp.items():
+                    ck_, cv = _canon(k), _canon(v)
+                    if ck_ and cv:
+                        alias[ck_] = cv
+        if not alias:
+            return None                       # 没有任何已证等价 → 保持旧行为（norm_text）
+
+        def f(v):
+            cv = _canon(v)
+            return alias.get(cv, cv)
+
+        f._tag = f"conv:{src_name}:{len(alias)}"
+        return f
+
+    nf_per_src = []
+    for si, s in enumerate(sources):
+        tpl_cols = [tk for tk, _sc, _cs in key_pairs[si]]
+        nf_per_src.append(_src_norm(s["name"], tpl_cols))
+
+    # ---- 口径本②：候选列"85% 闸门"（首选列空缺时，才允许用别的候选列补）----
+    # 判据：两候选列在都能取到值的行上，一致率 ≥85%（重叠 ≥10 行才判）；否则判"两套口径"，不许互补
+    GATE_RATE, GATE_MIN_OVERLAP = 0.85, 10
+    gates = {}            # (tcol, 候选列所属源) -> allow
+    gate_blocked = []     # 被拒的（列, 原因）
+    if len(sources) >= 2:
+        base_avail = {}
+        for i in template_df.index:
+            rv = {}
+            for kc in key_candidates:
+                if kc in template_df.columns and _has_value(template_df.at[i, kc]):
+                    rv[kc] = norm_text(template_df.at[i, kc])
+            base_avail[i] = rv
+        for tcol in target_cols:
+            cands = sorted(list(supply.get(tcol) or []), key=lambda c: -c["score"])
+            if len(cands) < 2:
+                continue
+            pref = cands[0]
+            pref_col = {pref["source"]: pref["col"]}
+            for alt in cands[1:]:
+                if alt["source"] == pref["source"] and alt["col"] == pref["col"]:
+                    continue
+                va, vb = [], []
+                for i in template_df.index:
+                    rv = base_avail.get(i) or {}
+                    if not rv:
+                        continue
+                    vals = {}
+                    for cd in (pref, alt):
+                        s2 = sources[cd["source"]]
+                        ccol = cd["col"]
+                        if ccol not in s2["df"].columns:
+                            continue
+                        pa = [(tk, scol, cs) for tk, scol, cs in key_pairs[cd["source"]]
+                              if tk in rv and tk != tcol]
+                        if not pa:
+                            continue
+                        m2 = _match_source(s2, pa, rv, key_min, ccol, idx_cache,
+                                           norm_fn=nf_per_src[cd["source"]])
+                        if m2 and m2[0] is not None:
+                            v2 = s2["df"][ccol].iloc[m2[0]]
+                            if _has_value(v2):
+                                vals[cd["source"]] = v2
+                    if len(vals) >= 2:
+                        va.append(vals[pref["source"]])
+                        vb.append(vals[alt["source"]])
+                same, tot, rate = _agree_of(va, vb)
+                allow = (tot < GATE_MIN_OVERLAP) or (rate >= GATE_RATE)
+                gates[(tcol, alt["source"])] = allow
+                if conventions is not None:
+                    try:
+                        conventions.record_col_verdict(tcol, sources[pref["source"]]["name"],
+                                                       sources[alt["source"]]["name"],
+                                                       rate, tot)
+                    except Exception:
+                        pass
+                if not allow:
+                    gate_blocked.append(
+                        f"「{tcol}」：{sources[pref['source']]['name']} 与 "
+                        f"{sources[alt['source']]['name']} 一致率仅 {rate * 100:.0f}%"
+                        f"（{same}/{tot}）→ 判定两套口径，**拒绝互相补缺**，请定以哪张表为准")
+    n_complement = 0      # 靠"次选候选列"补上的格数
+
     for r in range(1, int(max_rounds) + 1):
         # 本轮开始快照"可用钥匙"（本轮新补出的值下一轮才生效 → 级联逐轮推进、轮次可解释）
         avail_by_row = {}
@@ -750,11 +866,14 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                 best = None
                 tie_info = None
                 # 候选列按**列名匹配度**降序（列名更对的先用）；该列这行取不到值/无命中才回退下一列。
-                # 若首选列命中多行且取值不同 → 不猜、**也不回退**（否则会被"值恰好唯一的错列"顶上来）
-                for cand in sorted(list(supply.get(tcol) or []), key=lambda c: -c["score"]):
+                # 回退要过"85% 闸门"：两个候选列一致率 <85% → 判两套口径，**不许互相补缺**
+                _cands = sorted(list(supply.get(tcol) or []), key=lambda c: -c["score"])
+                for _ci, cand in enumerate(_cands):
                     si = cand["source"]
                     if si not in active:
                         continue
+                    if _ci > 0 and not gates.get((tcol, si), True):
+                        continue               # 口径不同 → 不互补
                     s = sources[si]
                     ccol = cand["col"]
                     if ccol not in s["df"].columns:
@@ -765,7 +884,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     if not pairs:
                         continue
                     m = _match_source(s, pairs, row_vals, key_min, ccol, idx_cache,
-                                      blank_on_tie=blank_on_tie)
+                                      blank_on_tie=blank_on_tie, norm_fn=nf_per_src[si])
                     if not m:
                         continue
                     j, sc, k_used, tie_n, exact, hit_rows = m
@@ -787,6 +906,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     if tie_n and not blank_on_tie:
                         sc = min(sc, 39.0)     # 旧行为：并列且取第 1 条 → 降档
                     best = (v, sc, k_used, tie_n, cand["how"], pairs)
+                    if _ci > 0:
+                        n_complement += 1      # 记：这格是靠次选候选列补的
                     break
                 if best:
                     v, sc, k_used, tie_n, how, pairs = best
@@ -1039,8 +1160,10 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
              "级联轮数": rounds_used, "间接补全格数": indirect, "歧义格数": ambiguous,
              "留空合计": n_fill["miss"],
              "延后源表数": len(deferred_sources),
-            "经验库命中": n_exp,
+             "经验库命中": n_exp,
             "非100%格数": n_fill["high"] + n_fill["mid"] + n_fill["low"],
+            "值等价学习(条)": n_equiv, "互补格数": n_complement,
+            "拒绝互补列": list(gate_blocked), "口径说明": list(equiv_notes),
              "复验组数": audit["组数"], "复验可比格": n_cmp, "复验不一致格": n_diff,
              "复验一致率": round(consistency * 100, 1),
              "两源可核对格": n_cross_cmp, "两源矛盾格": n_cross_bad,
