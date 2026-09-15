@@ -33,7 +33,7 @@ for /f "tokens=2" %%P in ("%STATUS%") do set "SPID=%%P"
 echo.
 echo [Update detected] Code changed since the server started. Restarting with the new code ...
 powershell -NoProfile -Command "Stop-Process -Id %SPID% -Force -ErrorAction SilentlyContinue" >nul 2>&1
-powershell -NoProfile -Command "for($i=0;$i -lt 20;$i++){ if(-not (Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue)){break}; Start-Sleep -Milliseconds 250 }" >nul 2>&1
+powershell -NoProfile -Command "$p=%PORT%; $free=0; for($i=0;$i -lt 60;$i++){ $ports=([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()).GetActiveTcpListeners() | ForEach-Object { $_.Port }; if($ports -contains $p){ $free=0 }else{ $free++ }; if($free -ge 3){break}; Start-Sleep -Milliseconds 150 }" >nul 2>&1
 goto :start
 
 :busy

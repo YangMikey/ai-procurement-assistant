@@ -22,14 +22,18 @@
 2. 端口被占时才跑原 PowerShell 判定（ours→REUSE / 代码更新→RESTART / 别的程序→NOTOURS）——此时端口活着，探测很快
 3. 开浏览器从"固定 4s"改为"**就绪即开**"：隐藏 waiter 用 .NET `GetActiveTcpListeners()` 每 150ms 查（**不用**会有 2.3s 惩罚的 TCP 连接探测）
 4. waiter 把耗时写 `logs/startup.log`，基准是 bat 启动时写的 `logs/launch_marker.txt`（单一时钟）
+5. **RESTART 竞态修复**：杀旧服务后原来的"端口一空就启"会撞上**端口尚未真正释放** → 新服务绑定失败（实测复现 1 次：新进程没起来、health 空）。改为**连续 3 次（每 150ms）确认端口空闲**再启动；`Get-NetTCPConnection` 换成 .NET `GetActiveTcpListeners()`（每次 0.3s → 毫秒级）
 
-**验收（各两遍，全实测）**
+**验收（全实测）**
 | 场景 | 实测 | 旧的 |
 |---|---|---|
 | 冷启动（双击→浏览器打开） | **2.9s / 3.0s**（health ok） | 固定 4.0s 开浏览器，但服务 ~5.2s 才就绪 → 白页 |
 | 复用（服务已在跑） | **1.41s / 1.55s**（PID 未变=没重启） | 同 |
+| RESTART（改过代码后双击） | **4.7s / 4.8s**（PID 更换、health ok） | 未测；且修复前有绑定失败风险 |
 | 探测阶段 | 0.05s | 2.28s |
 | 冷启动整体可用 | **~3.0–3.5s** | ~5.0–5.5s |
+
+**测试节奏/弹窗教训（2026-09-15 用户反馈）**：验证启动时每次都启动 bat → **每个 bat 启动会弹一个黑窗口**（bat 就是前台跑 streamlit），本次会话弹了 10+ 次，用户明确不满。**以后验证一律用隐藏窗口启动**（`Start-Process -WindowStyle Hidden`），只有"最终交付给用户的那一次"才正常启动；同类场景**跑一遍**、收尾统一跑两遍，别每步都两遍。
 
 **明确不做（都因实测无收益，别再提）**：`--server.fileWatcherType none`（watchdog 已装、项目仅 127 文件）、`--server.runOnSave false`、app.py 延迟导入（~0.1s）、"别删 `__pycache__`"（只值 0.054s）。
 
