@@ -20,6 +20,8 @@ import pandas as pd
 
 from .aligner import _bag_sim, _name_sim, norm_text
 from .conventions import agreement as _agree_of
+from .conventions import apply_rule_src as _apply_rule_src
+from .conventions import apply_rule_tpl as _apply_rule_tpl
 from .conventions import canon as _canon
 from .conventions import learn_value_equiv as _learn_equiv
 from .registry import skill
@@ -284,6 +286,7 @@ PROMOTE_MIN = 80.0        # 补出的值置信 ≥ 此分才允许"升级为钥�
 TIE_STOP_MIN = 80.0       # 钥匙命中多行时：≥此分视为"真歧义"（留空、不回退）；<此分当没命中
 MAX_ROUNDS = 4            # 级联最大轮数（提前收敛：某轮无新增即停）
 EXP_NS = "多表补全"        # 经验库命名空间（与两表匹配的键区分开）
+_NOT_SAME_SENTINEL = "\x00NOTSAME"   # 人工判过"不是一回事"的源值 → 归一到这里（与任何真实值都不相似）
 
 
 def exp_key_of(vals):
@@ -555,15 +558,16 @@ def _near_values(src, pairs, row_vals, target_col, lo=40.0, topn=3):
 
 
 def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on_tie=False,
-                  norm_fn=None):
+                  norm_fn=None, norm_fn_src=None):
     """按"钥匙层次 n→1"在源表里找最佳行；层内先精确（索引）后模糊。
 
     pairs: [(模板钥匙列, 源列, 列名匹配度)]（按模板钥匙列顺序）
     row_vals: {模板钥匙列: 归一化值}（本行可用且达标的钥匙）
-    norm_fn: 归一化函数（默认 norm_text；传口径本的 canon/等价映射时，`1事业部`↔`一` 可精确命中）
+    norm_fn / norm_fn_src: 模板侧 / 源表侧 归一化（口径本的规律与值等价在这里生效）
     返回 (row, score, k_used, tie_n, all_exact, rows) 或 None。
     """
     nf = norm_fn or norm_text
+    nfs = norm_fn_src or nf
     avail = [(tk, scol) for tk, scol, _ in pairs if row_vals.get(tk)]
     if not avail:
         return None
@@ -571,13 +575,14 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on
     for k in range(len(avail), 0, -1):
         sub = avail[:k]
         want = tuple(nf(row_vals[tk]) for tk, _ in sub)
-        ck = (id(df), tuple(scol for _, scol in sub), getattr(nf, "_tag", "raw"))
+        ck = (id(df), tuple(scol for _, scol in sub),
+              getattr(nf, "_tag", "raw"), getattr(nfs, "_tag", "raw"))
         idx = idx_cache.get(ck)
         if idx is None:
             cols = [df[c].tolist() for _, c in sub]
             idx = {}
             for j in range(len(df)):
-                t = tuple(nf(c[j]) for c in cols)
+                t = tuple(nfs(c[j]) for c in cols)
                 if all(t):
                     idx.setdefault(t, []).append(j)
             idx_cache[ck] = idx
@@ -586,7 +591,7 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on
             return _pick_row(rows, df, target_col, 100.0, k, True, blank_on_tie)
         best_score, best_rows = 0.0, []
         for j in range(len(df)):
-            vals = [nf(df[c].iloc[j]) for _, c in sub]
+            vals = [nfs(df[c].iloc[j]) for _, c in sub]
             if not all(vals):
                 continue
             sims = [_key_sim(vals[x], want[x]) for x in range(k)]
@@ -720,8 +725,11 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
             pass
 
     def _src_norm(src_name, tpl_cols):
-        """该源表的钥匙归一化：canon（去修饰词+数字互转）+ 该源表已学到的值等价。"""
-        alias = {}
+        """该源表的钥匙归一化：canon（去修饰词+数字互转）+ 该源表已学到的值等价 + 类推规律。
+
+        返回 (模板侧函数, 源表侧函数, 结论文本)；没有任何口径信息时返回 None（保持旧行为）。
+        """
+        alias, rules, not_same = {}, [], []
         if conventions is not None:
             for tc in tpl_cols:
                 try:
@@ -732,20 +740,46 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     ck_, cv = _canon(k), _canon(v)
                     if ck_ and cv:
                         alias[ck_] = cv
-        if not alias:
-            return None                       # 没有任何已证等价 → 保持旧行为（norm_text）
+                try:
+                    rules.extend(conventions.value_rules(tc, src_name) or [])
+                except Exception:
+                    pass
+                for _k, it in ((conventions.data.get("not_same") or {}).items()):
+                    if it.get("scope") == f"{tc}|{src_name}":
+                        not_same.append((norm_text(it.get("a")), norm_text(it.get("b"))))
+        if not alias and not rules and not not_same:
+            return None
+        ns_pairs = set(not_same)
 
-        def f(v):
-            cv = _canon(v)
-            return alias.get(cv, cv)
+        def f_tpl(v):
+            s = _canon(v)
+            for r in rules:
+                s = _apply_rule_tpl(r.get("rule") or {}, v)
+            return alias.get(s, s)
 
-        f._tag = f"conv:{src_name}:{len(alias)}"
-        return f
+        def f_src(v):
+            s = _canon(v)
+            for r in rules:
+                s = _apply_rule_src(r.get("rule") or {}, v)
+            s = alias.get(s, s)
+            for a, b in ns_pairs:                 # 人工判过"不是一回事"的 → 不许配上
+                if b and s == b:
+                    return _NOT_SAME_SENTINEL
+            return s
 
-    nf_per_src = []
+        f_tpl._tag = f"convT:{src_name}:{len(alias)}/{len(rules)}/{len(not_same)}"
+        f_src._tag = f"convS:{src_name}:{len(alias)}/{len(rules)}/{len(not_same)}"
+        return (f_tpl, f_src, f"{src_name}：值等价{len(alias)}条、类推规律{len(rules)}条、判定不同{len(not_same)}条")
+
+    nf_per_src, nf_notes = [], []
     for si, s in enumerate(sources):
         tpl_cols = [tk for tk, _sc, _cs in key_pairs[si]]
-        nf_per_src.append(_src_norm(s["name"], tpl_cols))
+        got = _src_norm(s["name"], tpl_cols)
+        if got:
+            nf_per_src.append((got[0], got[1]))
+            nf_notes.append(got[2])
+        else:
+            nf_per_src.append((None, None))
 
     # ---- 口径本②：候选列"85% 闸门"（首选列空缺时，才允许用别的候选列补）----
     # 判据：两候选列在都能取到值的行上，一致率 ≥85%（重叠 ≥10 行才判）；否则判"两套口径"，不许互补
@@ -785,7 +819,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                         if not pa:
                             continue
                         m2 = _match_source(s2, pa, rv, key_min, ccol, idx_cache,
-                                           norm_fn=nf_per_src[cd["source"]])
+                                           norm_fn=nf_per_src[cd["source"]][0],
+                                           norm_fn_src=nf_per_src[cd["source"]][1])
                         if m2 and m2[0] is not None:
                             v2 = s2["df"][ccol].iloc[m2[0]]
                             if _has_value(v2):
@@ -884,7 +919,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     if not pairs:
                         continue
                     m = _match_source(s, pairs, row_vals, key_min, ccol, idx_cache,
-                                      blank_on_tie=blank_on_tie, norm_fn=nf_per_src[si])
+                                      blank_on_tie=blank_on_tie,
+                                      norm_fn=nf_per_src[si][0], norm_fn_src=nf_per_src[si][1])
                     if not m:
                         continue
                     j, sc, k_used, tie_n, exact, hit_rows = m
@@ -1039,6 +1075,13 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                         audit["不一致"].append({"行号": i + 2, "列名": tcol,
                                                 "钥匙值": _row_key_text(template_df, i, key_pairs),
                                                 "主结果": a1, "复验结果": a2})
+    # ---- 需要人工确认的"值域"（只问值域；一次确认 → 整列类推）----
+    try:
+        value_questions = build_value_questions(template_df, sources, key_pairs,
+                                                conventions, topn=10)
+    except Exception:
+        value_questions = []
+
     n_cmp = audit["可比格"]
     n_diff = len(audit["不一致"])
     consistency = (1.0 - n_diff / n_cmp) if n_cmp else 1.0
@@ -1175,7 +1218,163 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     return {"result": result, "confidence": conf, "stats": stats,
             "supply": supply, "legend": legend_lines(stats), "key_pairs": key_pairs,
             "review": review_df, "audit": audit_df, "choices": choices_df,
-            "partial": partial_df, "cross": cross_df, "exp_key_cols": exp_cols}
+            "partial": partial_df, "cross": cross_df, "exp_key_cols": exp_cols,
+            "value_questions": value_questions}
+
+
+def build_value_questions(template_df, sources, key_pairs, conventions=None,
+                          topn=10, lo=40.0):
+    """生成"值域待确认清单"（只问值域，且**优先问"能类推整列"的**）。
+
+    每组 (模板列 ↔ 源表.源列) 只出一题：
+    - 类型"整列"：找到一对能推出**可整列自证**的规律（如 去后缀「事业部」+ 数字互换）
+      → 你点"是"，这一列以后全部 100%，同类不再问
+    - 类型"特例"：没有能通用自证的规律，但有一对相似度 ≥60 的
+      → 你点"是"，只记这一对；点"不是"，记住"这两回事"
+    - 相似度太低（<40）→ 当"源表没有"，直接留空、不打扰
+    """
+    from collections import Counter
+    from .conventions import infer_rule, verify_rule
+    qs = []
+    for si, s in enumerate(sources):
+        nm = s["name"]
+        for tk, scol, _cs in key_pairs[si]:
+            if tk not in template_df.columns or scol not in s["df"].columns:
+                continue
+            if conventions is not None:
+                try:
+                    if conventions.value_rules(tk, nm):
+                        continue                      # 已有类推规律 → 整列自动，不再问
+                except Exception:
+                    pass
+            tvals = [str(v) for v in template_df[tk].tolist() if _has_value(v)]
+            svals = [str(v) for v in s["df"][scol].tolist() if _has_value(v)]
+            if not tvals or not svals:
+                continue
+            done = set()
+            if conventions is not None:
+                try:
+                    done = {norm_text(k) for k in (conventions.value_mapping(tk, nm) or {})}
+                except Exception:
+                    done = set()
+            su = {norm_text(x) for x in svals}
+            cnt = Counter(norm_text(x) for x in tvals)
+            cands = []
+            for v, c in cnt.items():
+                if v in su or v in done:
+                    continue
+                sc, sv = max(((_key_sim(v, x), x) for x in su), default=(0.0, ""))
+                if sc >= lo:
+                    cands.append((sc, v, sv, c))
+            if not cands:
+                continue
+            cands.sort(reverse=True)
+            # ① 先找"能整列自证"的规律（这才是值得问的）
+            rule_q = None
+            for sc, v, sv, c in cands[:8]:
+                rule = infer_rule(v, sv)
+                if not rule:
+                    continue
+                ok, cov, why = verify_rule(rule, tvals, svals)
+                if ok:
+                    rule_q = {"类型": "整列", "列名": tk, "源表": nm, "源列": scol,
+                              "示例模板值": v, "示例源表值": sv, "规律": rule,
+                              "覆盖率": round(cov * 100, 1), "相似度": round(sc, 1),
+                              "影响格数": c, "同类数": len(cands),
+                              "模板前5": [x for x, _n in cnt.most_common(5)],
+                              "源前5": sorted(su)[:5]}
+                    break
+            if rule_q:
+                qs.append(rule_q)
+                continue
+            # ② 退而求其次：单值特例（相似度 ≥lo 就问 —— "看着像但不是"的也要让你能判"不是"）
+            sc, v, sv, c = cands[0]
+            if sc >= lo:
+                qs.append({"类型": "特例", "列名": tk, "源表": nm, "源列": scol,
+                           "示例模板值": v, "示例源表值": sv, "规律": None,
+                           "覆盖率": 0.0, "相似度": round(sc, 1),
+                           "影响格数": c, "同类数": len(cands),
+                           "模板前5": [x for x, _n in cnt.most_common(5)],
+                           "源前5": sorted(su)[:5]})
+    qs.sort(key=lambda q: (0 if q["类型"] == "整列" else 1, -q["相似度"], -q["影响格数"]))
+    return qs[:topn]
+
+
+def apply_value_answers(template_df, sources, answers, conventions):
+    """把"值域确认"的回答落进口径本（**一条回答解决一类**）。
+
+    answers: {(模板列, 源表名): "same"|"not"|"skip"}（问题里带的"规律"会被直接用）
+    返回已应用清单 [(类型, 说明)]。
+    """
+    from .conventions import infer_rule, verify_rule
+    by_name = {s["name"]: s for s in sources}
+    applied = []
+    for key, ans in (answers or {}).items():
+        if isinstance(key, (list, tuple)) and len(key) == 2:
+            tcol, sname = key
+        else:
+            continue
+        if isinstance(ans, dict):
+            ans_val, rule = ans.get("ans"), ans.get("rule")
+        else:
+            ans_val, rule = ans, None
+        if ans_val in (None, "", "skip"):
+            continue
+        s = by_name.get(sname)
+        if s is None:
+            continue
+        tvals = [str(v) for v in template_df[tcol].tolist() if _has_value(v)] \
+            if tcol in template_df.columns else []
+        cand = None
+        for c in s["df"].columns:
+            sc, _how = col_match(tcol, c, 50.0)
+            if cand is None or sc > cand[1]:
+                cand = (c, sc)
+        if not cand or not tvals:
+            continue
+        scol = cand[0]
+        svals = [str(v) for v in s["df"][scol].tolist() if _has_value(v)]
+        if ans_val == "not":
+            t0 = norm_text(tvals[0])
+            for sv in {norm_text(x) for x in svals}:
+                if _key_sim(t0, sv) >= 40:
+                    conventions.record_not_same([tcol, sname], t0, sv)
+            applied.append(("判不同", f"「{tcol}」← {sname}：已记住「这是两回事」，不再问、也不许模糊配上"))
+            continue
+        # same
+        if rule:                                   # 问题里已验证过的规律 → 直接整列类推
+            ok, cov, why = verify_rule(rule, tvals, svals)
+            if ok:
+                conventions.record_value_rule([tcol, sname], rule,
+                                              evidence=f"整列类推（{why}，覆盖 {cov:.0%}）")
+                applied.append(("类推整列",
+                                f"「{tcol}」← {sname}：规律={rule.get('kind')}，"
+                                f"整列通用（{cov:.0%}），以后 100%"))
+                continue
+        pair = None                                # 特例：找一对最像的
+        for tv in {norm_text(x) for x in tvals}:
+            sc, sv = max(((_key_sim(tv, x), x) for x in {norm_text(y) for y in svals}),
+                         default=(0.0, ""))
+            if pair is None or sc > pair[0]:
+                pair = (sc, tv, sv)
+        if not pair or not pair[2]:
+            continue
+        r2 = infer_rule(pair[1], pair[2])
+        if r2:
+            ok, cov, why = verify_rule(r2, tvals, svals)
+            if ok:
+                conventions.record_value_rule([tcol, sname], r2,
+                                              evidence=f"整列类推（{why}，覆盖 {cov:.0%}）")
+                applied.append(("类推整列",
+                                f"「{tcol}」← {sname}：规律={r2.get('kind')}，整列通用（{cov:.0%}）"))
+                continue
+            why = f"规律不通用（{why}）"
+        else:
+            why = "推不出通用规律"
+        conventions.record_value_equiv([tcol, sname], {pair[1]: pair[2]},
+                                       evidence=f"特例：{why}")
+        applied.append(("特例", f"「{tcol}」← {sname}：{pair[1]} = {pair[2]}（{why}）"))
+    return applied
 
 
 def _row_key_text(template_df, i, key_pairs):

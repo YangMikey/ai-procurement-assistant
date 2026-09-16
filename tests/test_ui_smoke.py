@@ -94,6 +94,18 @@ try:
 except Exception as e:
     print("   [skip] 另存检查：", e)
 
+# 「值域确认」：有问题才出现；出现时点一次「确定并应用」应能写库 + 重跑
+try:
+    _vq_keys = [getattr(x, "key", "") for x in at.radio if str(getattr(x, "key", "")).startswith("vq_")]
+    if _vq_keys and at.button(key="vq_apply"):
+        at.button(key="vq_apply").click()
+        at.run()
+        check("UI：值域确认「确定并应用」后重跑无异常", len(at.exception) == 0 and not at.error)
+    else:
+        print("   [info] 本次样例没有值域问题（无需确认）")
+except Exception as e:
+    print("   [skip] 值域确认检查：", e)
+
 # 多表补全：源表来源切到「粘贴文件路径」（新增分支）应能渲染
 try:
     at.radio(key="mf_srckind").set_value("粘贴文件路径")

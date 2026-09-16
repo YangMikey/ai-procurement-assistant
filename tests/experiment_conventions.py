@@ -19,8 +19,10 @@ sys.path.insert(0, _ROOT)
 
 import pandas as pd
 
-from core.conventions import ConventionStore, agreement, canon, learn_value_equiv
-from core.table_filler import fill_multi
+from core.conventions import (ConventionStore, agreement, canon, infer_rule,
+                              learn_value_equiv, verify_rule)
+from core.table_filler import (_auto_key_pairs, apply_value_answers,
+                               build_value_questions, fill_multi)
 
 ok = 0
 TMP = os.path.join(os.environ.get("TEMP", "."), "opencode", "conv_test.json")
@@ -93,6 +95,53 @@ _rH = fill_multi(_tH, key_cols=["钥匙"], sources=[_sC, _sD], audit_rounds=0, k
                  mapping={"值": (0, "值")})       # 首选源C（它缺 m12）
 check("闸门：一致率 100% → 允许互补（m12 由次选列补上）",
       str(_rH["result"]["值"].iloc[11]) == "V12" and _rH["stats"]["互补格数"] >= 1)
+
+# ---- ⑤ 值域问题清单 + 一条回答解决一类（**必须类推**）----
+_AA = ["1事业部", "2事业部", "3事业部"]
+_BB = ["一事业部", "二事业部", "三事业部"]
+check("规律：从 2事业部↔二事业部 推出 numeral 规律", infer_rule("2事业部", "二事业部") ==
+      {"kind": "numeral", "prefix": "", "suffix": "事业部"})
+check("规律自证：整列通用（覆盖 100%）", verify_rule(infer_rule("2事业部", "二事业部"), _AA, _BB)[0])
+check("规律守卫：会把不同值并成一个 → 拒绝",
+      not verify_rule({"kind": "drop_head", "n": 3}, ["广州科汇", "深圳科汇"], ["科汇", "科汇"])[0])
+
+tplQ = pd.DataFrame({"钥匙事业部": _AA, "值": ["", "", ""]})
+srcQ = {"name": "srcQ", "df": pd.DataFrame({"钥匙事业部": _BB, "值": ["A1", "A2", "A3"]})}
+stQ = store()
+kpQ = [_auto_key_pairs(["钥匙事业部"], srcQ, 70.0, None, tplQ, True)]
+qs = build_value_questions(tplQ, [srcQ], kpQ, stQ)
+check("问题清单：只出一题、类型=整列、示例对正确（不是 3↔二 那种乱问）",
+      len(qs) == 1 and qs[0]["类型"] == "整列"
+      and qs[0]["示例模板值"] == "2事业部" and qs[0]["示例源表值"] == "二事业部"
+      and qs[0]["覆盖率"] == 100.0 and qs[0]["同类数"] == 3)
+_ap = apply_value_answers(tplQ, [srcQ], {("钥匙事业部", "srcQ"): {"ans": "same", "rule": qs[0]["规律"]}},
+                          stQ)
+check("应用：整列类推（一条回答解决一类）", _ap and _ap[0][0] == "类推整列")
+_rQ = fill_multi(tplQ, key_cols=["钥匙事业部"], sources=[srcQ], audit_rounds=0, conventions=stQ)
+check("类推后：三行全部 100% 精确命中（不再有非100%）",
+      list(_rQ["result"]["值"]) == ["A1", "A2", "A3"]
+      and all("ok:100" in str(x) for x in _rQ["confidence"]["值"]))
+check("类推后：同一列不再出问题（同类不再问）",
+      build_value_questions(tplQ, [srcQ], kpQ, stQ) == [])
+check("口径本统计含 类推规律 1 条", stQ.stats()["类推规律"] == 1)
+
+# ---- ⑥ 判"不是"：记住、不再问、不许模糊配上 ----
+tplN = pd.DataFrame({"项目": ["石碑街道综合事务中心"], "值": [""]})
+srcN = {"name": "srcN", "df": pd.DataFrame({"项目": ["石碑大院"], "值": ["Z1"]})}
+stN = store()
+kpN = [_auto_key_pairs(["项目"], srcN, 70.0, None, tplN, True)]
+qN = build_value_questions(tplN, [srcN], kpN, stN)
+check("问题清单：看着像但不是的（57 分）也给出来让你判",
+      len(qN) == 1 and qN[0]["类型"] == "特例")
+apply_value_answers(tplN, [srcN], {("项目", "srcN"): "not"}, stN)
+check("判不同：已记住", stN.stats()["判定不同"] >= 1)
+check("判不同后：该格不再模糊填（留空）",
+      str(fill_multi(tplN, key_cols=["项目"], sources=[srcN], audit_rounds=0,
+                     conventions=stN)["result"]["值"].iloc[0]).strip() == "")
+check("判不同：已记住", stN.stats()["判定不同"] >= 1)
+check("判不同后：该格不再模糊填（留空）",
+      str(fill_multi(tplN, key_cols=["项目"], sources=[srcN], audit_rounds=0,
+                     conventions=stN)["result"]["值"].iloc[0]).strip() == "")
 
 if os.path.exists(TMP):
     os.remove(TMP)

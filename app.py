@@ -68,7 +68,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.06"
+BUILD = "2026-09-15.07"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -990,7 +990,9 @@ elif mode == "多表补全":
             _thr2 = st.slider("列名匹配阈值", 50, 100, 70, key="mf_thr",
                               help="越低越容易把两列认成同一列")
         with _c2:
-            _kmin2 = st.slider("钥匙最低相似度", 0, 60, 20, key="mf_kmin")
+            _kmin2 = st.slider("钥匙最低相似度（低于它一律不填，宁可留空）", 0, 100, 80, key="mf_kmin",
+                               help="实测建议 80：低于 80 分只算「像」、不算「是」，容易被错填。"
+                                    "调低会更敢填但更乱，自己权衡")
         with _c3:
             _rnd2 = st.slider("最大级联轮数", 1, 6, 4, key="mf_rounds",
                               help="某轮没有新补出就提前停")
@@ -1121,17 +1123,53 @@ elif mode == "多表补全":
                                 except Exception as _e2:
                                     st.error(f"写入经验库失败：{_e2}")
 
-            # ---- 抽查区：非 100% 的格 + 两源矛盾（默认展开，别让非100%藏起来）----
-            if (_pt is not None and len(_pt)) or (_cx is not None and len(_cx)):
-                with st.expander("② 抽查区（非 100% 的格 + 两源矛盾）", expanded=True):
-                    if _pt is not None and len(_pt):
-                        st.caption(f"非 100% 的 {len(_pt)} 格：模糊匹配/多把钥匙补出来的，建议抽查")
-                        st.dataframe(_pt, height=200, width="stretch")
-                    if _cx is not None and len(_cx):
-                        st.caption(f"**两源矛盾 {len(_cx)} 格**：两张源表都能供这一列、但给的值不一样"
-                                   f"（真的需要你判一下；导出件里有「两源矛盾」Sheet）")
-                        st.dataframe(_cx, height=200, width="stretch")
-            with st.expander("③ 细节（分档 / 用了哪几把钥匙 / 图例）"):
+            # ---- 值域确认（只问值域；一次确认 → 整列类推，同类不再问）----
+            _vqs = _mfres.get("value_questions") or []
+            if _vqs:
+                st.markdown(f"### 🧩 值域确认（{len(_vqs)} 条，一次确认就整列类推，同类不再问）")
+                _ans_vq = {}
+                for _qi, _q in enumerate(_vqs):
+                    _is_rule = (_q.get("类型") == "整列")
+                    _head = (f"**「{_q['列名']}」← {_q['源表']}.{_q['源列']}**"
+                             + (f"　规律：去掉共同修饰 + 数字互换（**整列 {_q['覆盖率']:.0f}% 通用**，"
+                                f"同类 {_q['同类数']} 条）" if _is_rule
+                                else f"　看着像，但不是规律能证的（相似度 {_q['相似度']}，同类 {_q['同类数']} 条）"))
+                    _ex = (f"例：模板「{_q['示例模板值']}」 ↔ 源「{_q['示例源表值']}」"
+                           f"｜模板还有：{'、'.join(str(x) for x in _q['模板前5'])}"
+                           f"｜源还有：{'、'.join(str(x) for x in _q['源前5'])}")
+                    _opts = (["就是同一个（按规律类推整列）", "不是，两回事", "暂不处理"] if _is_rule
+                             else ["就是同一个（只记这一对）", "不是，两回事", "暂不处理"])
+                    st.caption(_head)
+                    st.caption(_ex)
+                    _pickv = st.radio("怎么判？", _opts, index=2, horizontal=True,
+                                      key=file_key("vq", _q["列名"], _q["源表"], _qi))
+                    st.markdown("---")
+                    _ans_vq[(_q["列名"], _q["源表"])] = {
+                        "ans": "same" if _pickv.startswith("就是同一个") else
+                               ("not" if _pickv.startswith("不是") else "skip"),
+                        "rule": _q.get("规律")}
+                if st.button("✅ 确定并应用（写进口径本 → 立刻重跑）", type="primary", key="vq_apply"):
+                    try:
+                        from core.table_filler import apply_value_answers
+                        _apd = apply_value_answers(_tpl_df, _sources, _ans_vq, conv_store)
+                        st.session_state["vq_applied"] = [f"{t}：{m}" for t, m in _apd]
+                        _res_vq = fill_multi(_tpl_df, key_cols=_tkeys, sources=_sources,
+                                             mapping=_mapping2, col_threshold=float(_thr2),
+                                             key_min=float(_kmin2), max_rounds=int(_rnd2),
+                                             promote_min=float(_pmin2), auto_keys=bool(_autok2),
+                                             defer_single=bool(_def2), audit_rounds=int(_aud2),
+                                             audit_seed=int(_seed2), allow_domain=bool(_dom2),
+                                             experience=store, conventions=conv_store)
+                        st.session_state["mf_res"] = _res_vq
+                        st.rerun()
+                    except Exception as _e3:
+                        log_exception("值域确认应用失败", _e3)
+                        st.error(f"应用失败（已记日志）：{_e3}")
+            for _m3 in (st.session_state.pop("vq_applied", []) or []):
+                st.success("已应用：" + _m3)
+
+            # ---- 抽查区：非100% 只上色（不列清单）；两源矛盾收进细节 ----
+            with st.expander("③ 细节（分档 / 用了哪几把钥匙 / 两源矛盾 / 图例）"):
                 st.caption(f"高置信 {_st2['高置信(80-99%)']}｜中置信 {_st2['中置信(40-80%)']}｜"
                            f"低置信 {_st2['低置信(20-40%)']}｜有未补全格的行 {_st2['未补全行数']}｜"
                            f"级联轮数 {_st2.get('级联轮数', 1)}｜间接补全 {_st2.get('间接补全格数', 0)}｜"
@@ -1146,6 +1184,12 @@ elif mode == "多表补全":
                     "浅紫=低置信(20–40%)", "浅灰底空格=未匹配（留空）"]))
                 for _b in _blocked:
                     st.caption("🚧 " + _b)
+                if _cx is not None and len(_cx):
+                    st.caption(f"两源矛盾 {len(_cx)} 格（两张源表都能供这一列、值不一样；导出件有「两源矛盾」Sheet）")
+                    st.dataframe(_cx, height=200, width="stretch")
+                if _pt is not None and len(_pt):
+                    st.caption(f"非 100% 的 {len(_pt)} 格（已上色：浅黄/浅蓝/浅紫；明细只在下载件）")
+                    st.dataframe(_pt, height=200, width="stretch")
                 for _q in (_st2.get("口径说明") or []):
                     st.caption("· 值等价：" + _q)
                 _cst = conv_store.stats()
