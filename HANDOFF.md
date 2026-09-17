@@ -7,7 +7,27 @@
 > ```
 > 新会话第一步：读本文件 + PRD.md，然后按「下一步」继续。
 
-## 最新（2026-09-17·列供给标签修源表名 + 带工作表名）
+## 最新（2026-09-17·修「选择文件夹」报错 + 旧路径回灌）
+
+**用户报的 bug**：点「选择文件夹」后出错
+`导出出错（已记日志）：st.session_state.savedir_fill cannot be modified after the widget with key savedir_fill is instantiated.`
+
+**根因**：`ui_components.save_to_folder()` 里 `st.text_input(key=f"savedir_{sid}")` **先实例化**，
+再把选中目录写进**同一个 key** → Streamlit 明令禁止（widget 实例化后不得改它的 state）。
+
+**修**（`ui_components.py`）
+1. **改成"先选、后建"**：把 `browse_dir()` 挪到 text_input **之前**调用（列位置靠 `st.columns` 固定，
+   渲染先后不影响左右布局）→ 写 state 时 widget 还没实例化 ✓
+2. **`browse_dir(..., consume=True)`**：返回值**取走即清**（`session_state.pop`），
+   只在"真的选中"的那一次返回路径 → 否则每轮 rerun 都会把旧路径回灌、**覆盖用户手输的目录**
+3. **不再传 `value=`**（已有 state 时传 None）：消除 Streamlit 警告
+   `The widget with key "savedir_fill" was created with a default value but also had its value set via the Session State API`
+   （现在日志里 0 警告）
+
+**测试**：UI 冒烟 23→**26**（+3：选择文件夹后不报错 / 选中目录回填到输入框 / **手输目录不被上次选择回灌覆盖**）；
+**17 套 ×2 全过**；build → **2026-09-15.10**
+
+## 上一版（2026-09-17·列供给标签修源表名 + 带工作表名）
 
 **用户报的 bug**：「为什么有两个起始日期？我发现你的所有列都是只有一个表」
 （截图里 `「起始日期」←` 下拉出现两条都写"金蝶…"、有值分别是 **915 / 199**）

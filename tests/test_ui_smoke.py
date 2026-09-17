@@ -95,6 +95,27 @@ try:
 except Exception as e:
     print("   [skip] 另存检查：", e)
 
+# 回归：「选择文件夹」选完后必须把路径写进输入框（曾有 bug：先在 text_input 实例化后写 session_state
+# → st.session_state.savedir_fill cannot be modified after the widget ... is instantiated）
+try:
+    _picked_dir = os.path.join(tempfile.gettempdir(), "opencode", "ui_save_pick")
+    os.makedirs(_picked_dir, exist_ok=True)
+    at.session_state["browse_dir_fill_dir"] = _picked_dir   # 模拟"已选中文件夹"
+    at.run()
+    check("UI：选择文件夹后不报错（写 state 在 widget 之前）",
+          len(at.exception) == 0 and not at.error)
+    check("UI：选中的文件夹回填到输入框",
+          str(at.text_input(key="savedir_fill").value) == _picked_dir)
+    # 旧路径不能每轮回灌：手输新目录后再 rerun，应保持手输值
+    _manual = os.path.join(tempfile.gettempdir(), "opencode", "ui_save_manual")
+    os.makedirs(_manual, exist_ok=True)
+    at.text_input(key="savedir_fill").set_value(_manual)
+    at.run()
+    check("UI：手输目录不被上次选择回灌覆盖",
+          str(at.text_input(key="savedir_fill").value) == _manual)
+except Exception as e:
+    print("   [skip] 选文件夹回填检查：", e)
+
 # 「值域确认」：有问题才出现；出现时点一次「确定并应用」应能写库 + 重跑
 try:
     _vq_keys = [getattr(x, "key", "") for x in at.radio if str(getattr(x, "key", "")).startswith("vq_")]

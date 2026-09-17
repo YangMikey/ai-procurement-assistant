@@ -188,8 +188,12 @@ def browse_file_paths(key, label="📂 浏览选择文件（可多选）"):
     return list(st.session_state.get(f"{key}_list", []))
 
 
-def browse_dir(key, label="📂 选择文件夹"):
-    """弹原生「选择文件夹」对话框，选中后写入 session_state（{key}_dir）。返回该目录（可能为空）。"""
+def browse_dir(key, label="📂 选择文件夹", consume=False):
+    """弹原生「选择文件夹」对话框，选中后写入 session_state（{key}_dir）。返回该目录（可能为空）。
+
+    consume=True：返回值"取走即清"（只在真的选中的那一次返回路径），
+    避免每轮 rerun 都把同一个旧路径回灌、覆盖用户手输的目录。
+    """
     if st.button(label, key=key):
         code = ("import tkinter as tk, tkinter.filedialog, json\n"
                 "r = tk.Tk()\n"
@@ -217,6 +221,8 @@ def browse_dir(key, label="📂 选择文件夹"):
                 st.toast(f"已选文件夹：{path}")
         except Exception as e:
             st.error(f"打开文件夹选择框失败：{e}")
+    if consume:
+        return st.session_state.pop(f"{key}_dir", "")
     return st.session_state.get(f"{key}_dir", "")
 
 
@@ -227,17 +233,25 @@ def save_to_folder(file_bytes, file_name, sid, help_text=None):
     """
     _home = os.path.expanduser("~")
     _desk = os.path.join(_home, "Desktop")
-    _default = st.session_state.get(f"savedir_{sid}") or (_desk if os.path.isdir(_desk) else _home)
+    _dir_key = f"savedir_{sid}"
     c1, c2, c3 = st.columns([3, 1, 1])
-    with c1:
-        _dir = st.text_input("另存到文件夹（可直接粘贴完整路径）", value=_default,
-                             key=f"savedir_{sid}", help=help_text)
+    # 注意：必须先弹「选择文件夹」、再把结果写进 _dir_key，最后才实例化 text_input。
+    # 反了会报：st.session_state.savedir_xxx cannot be modified after the widget ... is instantiated
     with c2:
         st.write("")
-        _picked = browse_dir(f"browse_dir_{sid}")
-        if _picked:
-            st.session_state[f"savedir_{sid}"] = _picked
-            _dir = _picked
+        _picked = browse_dir(f"browse_dir_{sid}", consume=True)
+    if _picked:
+        st.session_state[_dir_key] = _picked
+    _default = st.session_state.get(_dir_key)
+    _has_state = _default is not None
+    if not _has_state:
+        _default = _desk if os.path.isdir(_desk) else _home
+    with c1:
+        # 已有 session_state（含刚选中的文件夹）时不再传 value，避免 Streamlit 的
+        # "created with a default value but also had its value set via the Session State API" 警告
+        _dir = st.text_input("另存到文件夹（可直接粘贴完整路径）",
+                             value=None if _has_state else _default,
+                             key=_dir_key, help=help_text)
     with c3:
         st.write("")
         if st.button("💾 另存到该文件夹", key=f"savebtn_{sid}"):
