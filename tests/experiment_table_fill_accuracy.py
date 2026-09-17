@@ -104,8 +104,7 @@ else:
         tpl = keys[tkeys].copy()
         tpl[target] = ""
         out = []
-        for tag, kw in (("改前", dict(auto_keys=False, defer_single=False, audit_rounds=0,
-                                      blank_on_tie=False)),
+        for tag, kw in (("改前", dict(auto_keys=False, defer_single=False, blank_on_tie=False)),
                         ("改后", dict())):
             r = fill_multi(tpl, key_cols=["项目名称"],
                            sources=[{"name": "答案表", "df": ans}], **kw)
@@ -121,8 +120,7 @@ else:
             f"填 {m2['填格']}｜对 {m2['对']}｜**错 {m2['错']}**｜留空 {m2['留空']}"
             f"｜歧义格 {r2['stats']['歧义格数']}",
             f"  实际钥匙列：{r2['stats']['实际钥匙列']}",
-            f"  需人工确认：{int(len(r2['review']))} 行（多候选留空/未补上）；"
-            f"复验存疑明细 {int(len(r2['audit']))} 格（不进主清单）",
+            f"  需人工确认：{int(len(r2['review']))} 行（多候选留空/未补上）",
             ""])
         for b in m1["错行"][:5]:
             lines.append(f"    {t1}错：行{b[0]} {b[1]}/{b[2]} 填了 {b[3]}，应为 {b[4]}")
@@ -141,7 +139,7 @@ else:
     n_fillB = int((rB["result"]["事业部"].astype(str).str.strip() != "").sum())
     lines += ["", "【场景B】源表=匹配表_001_合同进度表（列名是「项目/类别」，需自动认出）",
               f"  补上 {n_fillB}/{len(tplB)} 行｜对 {mB['对']}｜错 {mB['错']}｜留空 {mB['留空']}"
-              f"｜歧义格 {rB['stats']['歧义格数']}｜复验一致率 {rB['stats']['复验一致率']}%",
+              f"｜歧义格 {rB['stats']['歧义格数']}",
               f"  实际钥匙列：{rB['stats']['实际钥匙列']}"]
     for b in mB["错行"][:5]:
         lines.append(f"    错：行{b[0]} {b[1]}/{b[2]} 填了 {b[3]}，应为 {b[4]}")
@@ -160,9 +158,9 @@ else:
     check("场景C：改后歧义格进清单（多候选留空）",
           rC2["stats"]["歧义格数"] > 0
           and "多候选" in "".join(rC2["review"]["类型"].astype(str)))
-    check("场景C：清单只收必看（复验明细另存 audit）",
+    check("场景C：清单只收必看（多候选/未补上）",
           set(rC2["review"]["类型"].astype(str).map(lambda s: s.split("(")[0])) <= {"多候选", "未补上"}
-          and "复验不一致" not in set(rC2["review"]["类型"]))
+          )
     check("场景B：换一张真实表也能补上（自动认出「类别」）", n_fillB >= 5)
     check("场景B：对上人工答案的错值 ≤1 行", mB["错"] <= 1)
 

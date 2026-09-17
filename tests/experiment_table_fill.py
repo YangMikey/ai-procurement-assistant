@@ -193,7 +193,7 @@ check("列供给标签：用源表名格式且不报错",
       len(_lbls) >= 1 and all("【" in x and "(" in x for x in _lbls)
       and any(x.startswith("源B") for x in _lbls))
 
-# ================= 新增：自动配钥匙（值域/同义/择优/延后/复验） =================
+# ================= 新增：自动配钥匙（值域/同义/择优/延后/两源交叉） =================
 from core.table_filler import pair_col, plan_keys, value_domain_sim
 
 # --- 同义与级别冲突（采购三级分类 ↔ 类别；一级分类 不可替代）---
@@ -254,26 +254,6 @@ check("表级延后：关掉延后开关也能补上",
       str(fill_multi(_tF, key_cols=["项目名称"], sources=[{"name": "f", "df": _sF}],
                      defer_single=False)["result"]["金额"].iloc[0]) == "77")
 
-# --- 复验：只用"少一把钥匙"的降级对照 → 只报"降级后给出不同值"的真矛盾 ---
-_tK = pd.DataFrame({"K1": ["ZZZ", "ACME"], "K2": ["D", "B"], "V": ["", ""]})
-_sK = pd.DataFrame({"K1": ["ZZZ", "ZZZ", "ZZZ", "ACME", "ACME6"],
-                    "K2": ["D", "E", "D", "A", "B"],
-                    "V": ["w1", "w2", "w1b", "v1", "v2"]})
-_rK2 = fill_multi(_tK, key_cols=["K1"], sources=[{"name": "sK", "df": _sK}], audit_rounds=2)
-check("复验：跑降级对照（自动去重）、给出可比格与一致率",
-      _rK2["stats"]["复验组数"] >= 1 and _rK2["stats"]["复验可比格"] > 0
-      and 0 <= _rK2["stats"]["复验一致率"] <= 100)
-check("复验：降级后给出**不同值** → 记入明细（不进主清单）",
-      _rK2["stats"]["复验不一致格"] > 0 and len(_rK2["audit"]) > 0
-      and "复验不一致" not in set(_rK2["review"]["类型"]))
-check("清单只收「必看」：多候选(已留空) / 未补上 两类",
-      set(_rK2["review"]["类型"].astype(str).map(lambda s: s.split("(")[0])) <= {"多候选", "未补上"})
-check("复验：降级后只是\"定不出来\"→ 不算存疑（不当噪声）",
-      fill_multi(_tD, key_cols=["项目名称"], sources=[{"name": "sD", "df": _sD}],
-                 audit_rounds=2)["stats"]["复验不一致格"] == 0)
-check("复验：关掉复验则不跑（组数 0）",
-      fill_multi(_tK, key_cols=["K1"], sources=[{"name": "sK", "df": _sK}],
-                 audit_rounds=0)["stats"]["复验组数"] == 0)
 
 # --- 回归：类型守卫（"到期/截止"日期口径 与 "终止"状态口径 不许混）---
 check("列名：合同到期月份 ↔ 终止状态 不再判同义（曾误判 95）",
@@ -322,6 +302,8 @@ check("上限：fill_multi 里钥匙列也截到 4",
                      sources=[{"name": "sH", "df": _sH}])["key_pairs"][0]) <= 4)
 
 # --- 多源交叉核对：两张源表都能供同一列 → 两源都给值且不同 = 两源矛盾 ---
+_tK = pd.DataFrame({"K1": ["k1"], "值": [""]})
+_sK = pd.DataFrame({"K1": ["k1"], "值": ["X1"]})
 _tX = pd.DataFrame({"钥匙": ["k1", "k2"], "值": ["", ""]})
 _xA = {"name": "源A", "df": pd.DataFrame({"钥匙": ["k1", "k2"], "值": ["X1", "X2"]})}
 _xB = {"name": "源B", "df": pd.DataFrame({"钥匙": ["k1", "k2"], "值": ["X1", "Y2"]})}
@@ -333,21 +315,19 @@ check("两源交叉核对：可比 2 格、矛盾 1 格（行3 两源不同）�
 check("两源交叉核对：只有一张源表能供时不产生矛盾",
       fill_multi(_tK, key_cols=["K1"], sources=[{"name": "sK", "df": _sK}])["stats"]["两源可核对格"] == 0)
 
-# --- 复验默认已关（改为"少一把钥匙"的对照仅供开发回测）---
-check("复验默认关：默认调用不跑对照（组数 0）",
-      _rX["stats"]["复验组数"] == 0)
-
-# --- 清单导出：Sheet2「需人工确认」，复验明细单独一个 Sheet ---
-_rI = _rK2
+# --- 清单导出：Sheet2「需人工确认」+「两源矛盾」---
+_rI = fill_multi(pd.DataFrame({"钥匙": ["k1"], "值": [""]}), key_cols=["钥匙"],
+                 sources=[{"name": "f1", "df": pd.DataFrame({"钥匙": ["k1", "k1"],
+                                                            "值": ["X", "Y"]})}])
 _pI = os.path.join(os.path.dirname(TMP), "fill_review.xlsx")
 export_filled(_rI["result"], _rI["confidence"], _pI, stats=_rI["stats"],
-              review_df=_rI["review"], audit_df=_rI["audit"])
+              review_df=_rI["review"], cross_df=_rX.get("cross"))
 _wbI = load_workbook(_pI)
 check("清单导出：Sheet2「需人工确认」列名齐全（类型/行号/列名）",
       "需人工确认" in _wbI.sheetnames
       and [c.value for c in _wbI["需人工确认"][1]][:4] == ["类型", "行号", "列名", "钥匙值"])
-check("清单导出：复验明细写在「复验存疑」Sheet（不混进主清单）",
-      "复验存疑" in _wbI.sheetnames
-      and [c.value for c in _wbI["复验存疑"][1]][:2] == ["行号", "列名"])
+check("清单导出：两源矛盾单独一个 Sheet（不进主清单）",
+      "两源矛盾" in _wbI.sheetnames
+      and [c.value for c in _wbI["两源矛盾"][1]][:2] == ["行号", "列名"])
 
 print(f"\n===== 多表补全测试通过：{ok} 项断言（离线）=====")

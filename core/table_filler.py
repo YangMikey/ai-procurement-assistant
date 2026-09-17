@@ -609,13 +609,13 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on
 
 @skill(
     name="多表补全",
-    desc="按模板把多张源表汇总补齐：自动配钥匙列(≤4，含值域识别) + 单钥匙源表延后 + 随机换组合复验 + 置信分档上色",
+    desc="按模板把多张源表汇总补齐：自动配钥匙列(≤4，含值域识别) + 单钥匙源表延后 + 值域/列口径确认 + 置信分档上色",
     inputs={"template_df": "模板表", "key_cols": "模板钥匙列(≤4，按优先级，可留空交给自动)",
             "sources": "[{name, df}]（源表钥匙由系统自动识别）", "mapping": "模板列→源列（可选覆盖）",
             "col_threshold": "列名匹配阈值(默认70)", "key_min": "钥匙最低分(默认20)",
             "max_rounds": "级联最大轮数(默认4)", "promote_min": "升级为钥匙的置信门槛(默认80)",
             "auto_keys": "自动补钥匙列(默认开)", "defer_single": "单钥匙源表第1轮延后(默认开)",
-            "audit_rounds": "随机换组合复验组数(默认2)", "audit_seed": "复验随机种子(默认42)"},
+            "conventions": "口径本（列配对/值等价/类推规律/判定不同）"},
     outputs={"result": "补全后的表", "confidence": "逐格置信度(含轮次)", "stats": "统计",
              "supply": "列供给", "legend": "图例/说明", "review": "需人工确认清单"},
     task_modes=["多表补全"],
@@ -623,16 +623,15 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on
 def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                col_threshold=COL_DEFAULT_THRESHOLD, key_min=KEY_MIN,
                key_cols=None, max_rounds=MAX_ROUNDS, promote_min=PROMOTE_MIN,
-               auto_keys=True, defer_single=True, audit_rounds=0, audit_seed=42,
-               allow_domain=True, key_plan=None, _audit=False, max_keys=4,
+               auto_keys=True, defer_single=True,
+               allow_domain=True, key_plan=None, max_keys=4,
                blank_on_tie=True, experience=None, conventions=None):
-    """多源 → 模板 单向填充（自动配钥匙 + 分层钥匙 + 级联 + 复验）。
+    """多源 → 模板 单向填充（自动配钥匙 + 分层钥匙 + 级联 + 值域确认）。
 
     - 模板钥匙列 ≤4 个（你点的列优先；不够时自动按"歧义率低→覆盖率高→列数少"补位）
     - 源表钥匙自动配对：列名（同名/同义/近似）→ 不达标再试**值域指纹**
     - 单钥匙源表：第 1 轮整表延后，第 2 轮起能凑到 ≥2 把就用复合钥匙，仍只有 1 把就按 1 把匹配
     - 级联：最多 max_rounds 轮，某轮无新增即停；补出的值 ≥ promote_min 才可当钥匙（×0.9/跳）
-    - 复验：另外用「少一把钥匙」的降级对照再跑一遍，定不出来/取值不同的格进「需人工确认」清单
     - blank_on_tie=True（默认）：命中多行且取值不同 → **留空**交人工（不猜第 1 条）
     - experience：经验库实例（传了就启用）——人工确认过的格**下次自动填**、标 `·经验库`、不再问
     - 返回 `choices`：多候选的**候选值**与"未补上"的**最接近 3 个候选**（供页面一键确认 → 写经验库）
@@ -668,6 +667,24 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                                                s.get("key_col"), template_df, allow_domain)
                                for s in sources], "notes": []}
     key_pairs = plan["per_source"]
+    # ---- 口径本里"人工确认过的列配对"：强制生效（可当钥匙）----
+    if conventions is not None:
+        for si, s in enumerate(sources):
+            nm = s["name"]
+            for tk in [c for c in template_df.columns]:
+                try:
+                    cp = conventions.col_pair(tk, nm)
+                except Exception:
+                    cp = None
+                if not cp:
+                    continue
+                col = cp.get("col")
+                if col not in s["df"].columns:
+                    continue
+                key_pairs[si] = [(a, b, c) for a, b, c in key_pairs[si] if a != tk]
+                key_pairs[si].append((tk, col, 100.0))
+                if tk not in key_candidates:
+                    key_candidates.append(tk)
     supply = discover_supply(target_cols, sources, col_threshold, mapping)
 
     result = template_df.copy()
@@ -932,7 +949,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                             if v not in uniq:
                                 uniq.append(v)
                         if tie_info is None:
-                            tie_info = (tie_n, k_used, cand["how"], uniq[:3], s["name"])
+                            tie_info = (tie_n, k_used, cand["how"], uniq[:3], s["name"], ccol)
                         continue
                     v = s["df"][ccol].iloc[j]
                     if not _has_value(v):      # 这行该列为空 → 回退下一列
@@ -994,12 +1011,12 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     # ---- 候选表（供页面一键确认 → 写进经验库，下次自动填）----
     _ch_cols = ["行号", "列名", "类型", "钥匙值", "候选1", "候选2", "候选3", "备注"]
     choices = []
-    for (i, tcol), (tn, k_used, how, cand_vals, sname) in tie_cells.items():
+    for (i, tcol), (tn, k_used, how, cand_vals, sname, scol2) in tie_cells.items():
         cand_vals = list(cand_vals) + [""] * (3 - len(cand_vals))
         choices.append({"行号": i + 2, "列名": tcol, "类型": "多候选",
                         "钥匙值": _row_key_text(template_df, i, key_pairs),
                         "候选1": cand_vals[0], "候选2": cand_vals[1], "候选3": cand_vals[2],
-                        "备注": f"{sname} 同键 {tn} 行取值不同"})
+                        "备注": f"{sname} →【{scol2}】同键 {tn} 行取值不同"})
     for i in template_df.index:                 # 未补上 → 给最接近的 3 个候选
         for tcol in target_cols:
             if (i, tcol) in tie_cells:
@@ -1033,58 +1050,16 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     choices_df = pd.DataFrame(choices, columns=_ch_cols) if choices \
         else pd.DataFrame(columns=_ch_cols)
 
-    # ---- 复验：只用"同一语义的降级对照"（少用一把 / 退到单钥匙），不抽无关列 ----
-    audit = {"组数": 0, "可比格": 0, "不一致": []}
-    if audit_rounds and not _audit:
-        alt_plans, seen_alt = [], set()
-        for kind in ("drop_last", "single", "drop_first"):
-            per, changed = [], False
-            for si in range(len(sources)):
-                main = key_pairs[si]
-                if kind == "drop_last" and len(main) >= 2:
-                    per.append(main[:-1]); changed = True
-                elif kind == "drop_first" and len(main) >= 3:
-                    per.append(main[1:]); changed = True
-                elif kind == "single" and len(main) >= 2:
-                    per.append(main[:1]); changed = True
-                else:
-                    per.append(main)
-            key = tuple(tuple((p[0], p[1]) for p in pr) for pr in per)
-            if changed and key not in seen_alt:
-                seen_alt.add(key)
-                alt_plans.append(per)
-        for alt in alt_plans[:max(0, int(audit_rounds))]:
-            try:
-                r2 = fill_multi(template_df, key_cols=tkeys, sources=sources, mapping=mapping,
-                                col_threshold=col_threshold, key_min=key_min,
-                                max_rounds=max_rounds, promote_min=promote_min,
-                                auto_keys=False, defer_single=defer_single,
-                                audit_rounds=0, allow_domain=allow_domain,
-                                key_plan=alt, _audit=True, max_keys=max_keys)
-            except Exception:
-                continue
-            audit["组数"] += 1
-            res2 = r2["result"]
-            for tcol in target_cols:
-                for i in template_df.index:
-                    a1, a2 = result.at[i, tcol], res2.at[i, tcol]
-                    if not _has_value(a1) or not _has_value(a2):
-                        continue          # 降级后"定不出来"不是问题（说明第二把钥匙在起作用）
-                    audit["可比格"] += 1
-                    if norm_text(a1) != norm_text(a2):
-                        audit["不一致"].append({"行号": i + 2, "列名": tcol,
-                                                "钥匙值": _row_key_text(template_df, i, key_pairs),
-                                                "主结果": a1, "复验结果": a2})
-    # ---- 需要人工确认的"值域"（只问值域；一次确认 → 整列类推）----
+    # ---- 需要人工确认的"列口径 + 值域"（一次确认 → 列配对生效 / 整列类推）----
     try:
-        value_questions = build_value_questions(template_df, sources, key_pairs,
-                                                conventions, topn=10)
+        _cq = build_col_questions(template_df, sources, key_pairs, conventions, topn=6)
     except Exception:
-        value_questions = []
-
-    n_cmp = audit["可比格"]
-    n_diff = len(audit["不一致"])
-    consistency = (1.0 - n_diff / n_cmp) if n_cmp else 1.0
+        _cq = []
+    try:
+        _vq = build_value_questions(template_df, sources, key_pairs, conventions, topn=10)
+    except Exception:
+        _vq = []
+    value_questions = (_cq[:4] + _vq)[:10]      # 列口径最多 4 条，给值域题留位置
 
     # ---- 多源交叉核对（**独立复核**：两张源表都能供同一列时，比对两源给的值）----
     # 两源都有值且不同 = 矛盾。**按列自校准**：某列矛盾率 >50% → 判为"同名不同口径"，
@@ -1153,29 +1128,26 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     cross_rate = (1.0 - n_cross_bad / n_cross_cmp) if n_cross_cmp else 1.0
 
     # ---- 需人工确认清单：只收「必看」（多候选留空 / 未补上）----
-    # 「复验不一致」本质是"少一把钥匙→配到别的行"的预期差异，对用户没有可执行动作 →
-    # 不进主清单，只留质量分 + 明细（audit_detail，页面折叠/导出第三个 Sheet）
     review = []
-    for (i, tcol), (tn, k_used, _how, _cv, _sn) in tie_cells.items():
+    for (i, tcol), (tn, k_used, _how, _cv, _sn, _scol) in tie_cells.items():
         review.append({"类型": f"多候选(已留空,{tn}行取值不同)", "行号": i + 2, "列名": tcol,
-                       "钥匙值": _row_key_text(template_df, i, key_pairs), "主结果": ""})
+                       "钥匙值": _row_key_text(template_df, i, key_pairs), "主结果": "",
+                       "源表": _sn, "源列": _scol})
     for i in template_df.index:
         for tcol in target_cols:
             if (i, tcol) in tie_cells:
                 continue
             if not _has_value(result.at[i, tcol]) and not _has_value(template_df.at[i, tcol]):
                 review.append({"类型": "未补上", "行号": i + 2, "列名": tcol,
-                               "钥匙值": _row_key_text(template_df, i, key_pairs), "主结果": ""})
-    _rev_cols = ["类型", "行号", "列名", "钥匙值", "主结果"]
+                               "钥匙值": _row_key_text(template_df, i, key_pairs), "主结果": "",
+                               "源表": "", "源列": ""})
+    _rev_cols = ["类型", "行号", "列名", "钥匙值", "主结果", "源表", "源列"]
     if review:
         review.sort(key=lambda r: (0 if str(r.get("类型", "")).startswith("多候选") else 1,
                                    r.get("行号", 0), str(r.get("列名", ""))))
         review_df = pd.DataFrame(review, columns=_rev_cols)
     else:
         review_df = pd.DataFrame(columns=_rev_cols)
-    _aud_cols = ["行号", "列名", "钥匙值", "主结果", "复验结果"]
-    audit_df = pd.DataFrame(audit["不一致"], columns=_aud_cols) if audit["不一致"] \
-        else pd.DataFrame(columns=_aud_cols)
 
     # ---- 抽查清单：所有**非 100%** 的填充格（模糊/多钥匙/级联 → 都要让人能看到）----
     _pt_cols = ["行号", "列名", "值", "置信", "钥匙值"]
@@ -1207,8 +1179,6 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
             "非100%格数": n_fill["high"] + n_fill["mid"] + n_fill["low"],
             "值等价学习(条)": n_equiv, "互补格数": n_complement,
             "拒绝互补列": list(gate_blocked), "口径说明": list(equiv_notes),
-             "复验组数": audit["组数"], "复验可比格": n_cmp, "复验不一致格": n_diff,
-             "复验一致率": round(consistency * 100, 1),
              "两源可核对格": n_cross_cmp, "两源矛盾格": n_cross_bad,
              "两源一致率": round(cross_rate * 100, 1),
              "两源口径不同列": list(cross.get("口径不同") or []),
@@ -1217,7 +1187,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
              "未补全行数": int((conf[target_cols] == "miss").any(axis=1).sum()) if target_cols else 0}
     return {"result": result, "confidence": conf, "stats": stats,
             "supply": supply, "legend": legend_lines(stats), "key_pairs": key_pairs,
-            "review": review_df, "audit": audit_df, "choices": choices_df,
+            "review": review_df, "choices": choices_df,
             "partial": partial_df, "cross": cross_df, "exp_key_cols": exp_cols,
             "value_questions": value_questions}
 
@@ -1275,10 +1245,10 @@ def build_value_questions(template_df, sources, key_pairs, conventions=None,
                 rule = infer_rule(v, sv)
                 if not rule:
                     continue
-                ok, cov, why = verify_rule(rule, tvals, svals)
+                ok, cov, why, rule2 = verify_rule(rule, tvals, svals)
                 if ok:
                     rule_q = {"类型": "整列", "列名": tk, "源表": nm, "源列": scol,
-                              "示例模板值": v, "示例源表值": sv, "规律": rule,
+                              "示例模板值": v, "示例源表值": sv, "规律": rule2 or rule,
                               "覆盖率": round(cov * 100, 1), "相似度": round(sc, 1),
                               "影响格数": c, "同类数": len(cands),
                               "模板前5": [x for x, _n in cnt.most_common(5)],
@@ -1287,9 +1257,10 @@ def build_value_questions(template_df, sources, key_pairs, conventions=None,
             if rule_q:
                 qs.append(rule_q)
                 continue
-            # ② 退而求其次：单值特例（相似度 ≥lo 就问 —— "看着像但不是"的也要让你能判"不是"）
-            sc, v, sv, c = cands[0]
-            if sc >= lo:
+            # ② 没有整列规律 → **同类逐条列出来**（每条单独问，你一条条点）
+            for sc, v, sv, c in cands:
+                if sc < lo:
+                    break
                 qs.append({"类型": "特例", "列名": tk, "源表": nm, "源列": scol,
                            "示例模板值": v, "示例源表值": sv, "规律": None,
                            "覆盖率": 0.0, "相似度": round(sc, 1),
@@ -1315,6 +1286,12 @@ def apply_value_answers(template_df, sources, answers, conventions):
         else:
             continue
         if isinstance(ans, dict):
+            if ans.get("type") == "列口径":
+                _t3, _m3 = apply_col_answer(template_df, sources, tcol, sname,
+                                            ans.get("src_col"), ans.get("ans"), conventions)
+                if _t3:
+                    applied.append((_t3, _m3))
+                continue
             ans_val, rule = ans.get("ans"), ans.get("rule")
         else:
             ans_val, rule = ans, None
@@ -1343,10 +1320,10 @@ def apply_value_answers(template_df, sources, answers, conventions):
             continue
         # same
         if rule:                                   # 问题里已验证过的规律 → 直接整列类推
-            ok, cov, why = verify_rule(rule, tvals, svals)
+            ok, cov, why, rule2 = verify_rule(rule, tvals, svals)
             if ok:
-                conventions.record_value_rule([tcol, sname], rule,
-                                              evidence=f"整列类推（{why}，覆盖 {cov:.0%}）")
+                conventions.record_value_rule([tcol, sname], rule2 or rule,
+                                              evidence=f"整列类推（{why}）")
                 applied.append(("类推整列",
                                 f"「{tcol}」← {sname}：规律={rule.get('kind')}，"
                                 f"整列通用（{cov:.0%}），以后 100%"))
@@ -1361,10 +1338,10 @@ def apply_value_answers(template_df, sources, answers, conventions):
             continue
         r2 = infer_rule(pair[1], pair[2])
         if r2:
-            ok, cov, why = verify_rule(r2, tvals, svals)
+            ok, cov, why, r2b = verify_rule(r2, tvals, svals)
             if ok:
-                conventions.record_value_rule([tcol, sname], r2,
-                                              evidence=f"整列类推（{why}，覆盖 {cov:.0%}）")
+                conventions.record_value_rule([tcol, sname], r2b or r2,
+                                              evidence=f"整列类推（{why}）")
                 applied.append(("类推整列",
                                 f"「{tcol}」← {sname}：规律={r2.get('kind')}，整列通用（{cov:.0%}）"))
                 continue
@@ -1375,6 +1352,100 @@ def apply_value_answers(template_df, sources, answers, conventions):
                                        evidence=f"特例：{why}")
         applied.append(("特例", f"「{tcol}」← {sname}：{pair[1]} = {pair[2]}（{why}）"))
     return applied
+
+
+def all_supply_options(tpl_col, sources, col_threshold=COL_DEFAULT_THRESHOLD, mapping=None,
+                       conventions=None):
+    """「列供给」下拉用：**列出所有源表的所有列**（不按阈值筛掉），附列名分数/值域提示。
+
+    手动映射优先排第一；其余按（列名分 → 值域重合 → 有值数）排序。**0% 也列**，由人来判断。
+    返回 [{source, col, score, how, filled, domain}]。
+    """
+    mapping = mapping or {}
+    out = []
+    for si, s in enumerate(sources):
+        df = s["df"]
+        for col in df.columns:
+            if col == s.get("key_col") and len(df.columns) > 1 and False:
+                continue
+            manual = bool(mapping.get(tpl_col)) and tuple(mapping[tpl_col]) == (si, col)
+            score, how = col_match(tpl_col, col, col_threshold)
+            dom = 0.0
+            try:
+                if tpl_col in getattr(df, "columns", []) or True:
+                    pass
+            except Exception:
+                pass
+            auto = (conventions.col_pair(tpl_col, s["name"]) if conventions is not None else None)
+            if auto and auto.get("col") == col:
+                how = "已确认"
+            out.append({"source": si, "col": col,
+                        "score": 101.0 if manual else score,
+                        "how": "手动" if manual else how,
+                        "filled": int(df[col].notna().sum()),
+                        "domain": dom})
+    out.sort(key=lambda c: (-c["score"], -c["filled"]))
+    return out
+
+
+def build_col_questions(template_df, sources, key_pairs, conventions=None, topn=6):
+    """「列口径」题：**钥匙列**在源表里没配上（含表头被判冲突），但**值域高度像** → 出题问一次。
+
+    你点"是"→ 记进口径本当列配对（以后它就能当钥匙）；点"不是"→ 记住、不再问。
+    """
+    from .conventions import domain_overlap
+    qs = []
+    for si, s in enumerate(sources):
+        paired_tks = {tk for tk, _c, _sc in key_pairs[si]}
+        for tk in [c for c in template_df.columns]:
+            if tk in paired_tks:
+                continue
+            if tk not in template_df.columns:
+                continue
+            tvals = [str(v) for v in template_df[tk].tolist() if _has_value(v)]
+            if not tvals:
+                continue
+            for col in s["df"].columns:
+                svals = [str(v) for v in s["df"][col].tolist() if _has_value(v)]
+                if not svals:
+                    continue
+                ok, cov = domain_overlap(tvals, svals)
+                if not ok:
+                    continue
+                sc, _how = col_match(tk, col, COL_DEFAULT_THRESHOLD)
+                if sc >= COL_DEFAULT_THRESHOLD:
+                    continue                       # 表头本来就配得上 → 不用问
+                ex_a = next((v for v in tvals), "")
+                ex_b = ""
+                for v in svals:
+                    if _key_sim(ex_a, v) >= 60 or _canon(v) in _canon(ex_a) or _canon(ex_a) in _canon(v):
+                        ex_b = v
+                        break
+                qs.append({"类型": "列口径", "列名": tk, "源表": s["name"], "源列": col,
+                           "覆盖率": round(cov * 100, 1), "相似度": round(cov * 100, 1),
+                           "影响格数": len({str(v) for v in tvals}),
+                           "同类数": len([v for v in svals]),
+                           "示例模板值": ex_a, "示例源表值": ex_b or (svals[0] if svals else ""),
+                           "模板前5": sorted({str(v) for v in tvals})[:5],
+                           "源前5": sorted({str(v) for v in svals})[:5]})
+                break
+    qs.sort(key=lambda q: -q["覆盖率"])
+    return qs[:topn]
+
+
+def apply_col_answer(template_df, sources, tcol, sname, scol, ans, conventions):
+    """「列口径」题的落地：确认 → 记录列配对（以后可当钥匙）；不是 → 记住不再问。"""
+    if ans == "same":
+        conventions.record_col_pair(tcol, sname, scol, src="confirmed",
+                                    evidence="值域高度重合，人工确认")
+        return ("列配对", f"「{tcol}」← {sname}→【{scol}】已确认，以后它可作为钥匙使用")
+    if ans == "not":
+        try:
+            conventions.record_not_same([tcol, sname], tcol, scol)
+        except Exception:
+            pass
+        return ("判不同", f"「{tcol}」← {sname}→【{scol}】已记为两回事，不再问")
+    return (None, None)
 
 
 def _row_key_text(template_df, i, key_pairs):
@@ -1454,11 +1525,6 @@ def legend_lines(stats):
         extra.append(f"有 {stats['歧义格数']} 格命中多行且取值不同 → **已留空**（见「需人工确认」清单，选一条填）")
     if stats.get("延后源表数"):
         extra.append(f"有 {stats['延后源表数']} 张源表第 1 轮延后（只有 1 把钥匙，等后续轮次凑第二把）")
-    if stats.get("复验组数"):
-        extra.append(f"复验（仅开发回测）：另用「少一把钥匙」的对照跑了 {stats['复验组数']} 遍，"
-                     f"可比 {stats.get('复验可比格', 0)} 格、一致率 {stats.get('复验一致率', 100)}%"
-                     f"（不一致 {stats.get('复验不一致格', 0)} 格属于「少钥匙→配到别的行」的预期差异）")
-    if stats.get("两源可核对格"):
         extra.append(f"两源交叉核对：{stats['两源可核对格']} 格有两张源表都能供（都精确命中才比），"
                      f"其中矛盾 {stats.get('两源矛盾格', 0)} 格（一致率 {stats.get('两源一致率', 100)}%）"
                      + ("，见「两源矛盾」Sheet / 页面抽查区" if stats.get("两源矛盾格") else ""))
@@ -1470,7 +1536,7 @@ def legend_lines(stats):
 
 
 def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, review_df=None,
-                  audit_df=None, cross_df=None):
+                  cross_df=None):
     """写出带颜色的整合表 + 下方备注块（表头/列宽/冻结/筛选/数字格式由 theme 统一处理）。"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -1517,13 +1583,6 @@ def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, re
                 ws4.append(["" if (v is None or (not isinstance(v, str) and pd.isna(v))) else v
                             for v in row])
             _style(ws4, 1, highlight_min=False)
-        if audit_df is not None and len(audit_df):
-            ws3 = wb.create_sheet("复验存疑")
-            ws3.append([str(c) for c in audit_df.columns])
-            for _, row in audit_df.iterrows():
-                ws3.append(["" if (v is None or (not isinstance(v, str) and pd.isna(v))) else v
-                            for v in row])
-            _style(ws3, 1, highlight_min=False)
     except Exception:
         pass
     wb.save(out_path)

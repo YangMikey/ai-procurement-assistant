@@ -68,7 +68,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.07"
+BUILD = "2026-09-15.08"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -1006,11 +1006,6 @@ elif mode == "多表补全":
                                 help="两列取值高度重合就认成同一类列；小表（唯一值<5）不启用")
             _def2 = st.checkbox("只有 1 把钥匙的源表第 1 轮先延后", value=True, key="mf_defer",
                                 help="等后续轮次凑到第二把钥匙再两把一起用；始终只有 1 把就按 1 把匹配")
-            _aud2 = st.slider("复验：另用「少一把钥匙」的对照再跑几遍（0=不跑，默认关）", 0, 3, 0,
-                              key="mf_audit",
-                              help="实测：它只是「少一把钥匙 → 配到别的行」的预期差异，不是错值信号；"
-                                   "默认关，仅开发回测用")
-            _seed2 = st.number_input("复验随机种子（已弃用）", 0, 99999, 42, key="mf_seed")
         try:
             from core.table_filler import preview_keys as _pk
             _kp = _pk(_tkeys or list(_tpl_df.columns)[:1], _sources, float(_thr2),
@@ -1021,19 +1016,20 @@ elif mode == "多表补全":
         except Exception:
             pass
 
-        from core.table_filler import discover_supply as _disc, supply_option_label as _lbl
+        from core.table_filler import all_supply_options as _allopt
         _tcols2 = [c for c in _tpl_df.columns if c not in _tkeys]
-        _sup = _disc(_tcols2, _sources, float(_thr2))
         _mapping2 = {}
+        st.caption("下拉里**列出所有源表的所有列**（含 0 分，由你判断）；排序只是参考，不筛列。")
         for _tcol in _tcols2:
-            _cands = _sup.get(_tcol) or []
-            _opts = ["不补"] + [_lbl(_c, _sources) for _c in _cands]
-            _def = 1 if _cands else 0
-            _pickc2 = st.selectbox(f"「{_tcol}」←", _opts, index=_def,
+            _opts_raw = _allopt(_tcol, _sources, float(_thr2), _mapping2, conv_store)
+            _labels = ["不补"] + [
+                f"{_s['name']} →【{_c['col']}】({_c['how']},{_c['score']:.0f}｜有值 {_c['filled']})"
+                for _c in _opts_raw]
+            _def = 1 if _opts_raw else 0
+            _pickc2 = st.selectbox(f"「{_tcol}」←", _labels, index=_def,
                                    key=file_key("mfmap", _tcol, _thr2))
             if _pickc2 != "不补":
-                _idx2 = _opts.index(_pickc2) - 1
-                _c2 = _cands[_idx2]
+                _c2 = _opts_raw[_labels.index(_pickc2) - 1]
                 _mapping2[_tcol] = (_c2["source"], _c2["col"])
         st.caption("颜色图例：" + "；".join([
             "无色=完全匹配(100%)", "浅黄=高置信(80–99%)", "浅蓝=中置信(40–80%)",
@@ -1041,13 +1037,12 @@ elif mode == "多表补全":
 
         if st.button("生成补全表", type="primary", key="mf_go"):
             try:
-                with st.spinner("填充中…（自动配钥匙 + 级联 + 复验）"):
+                with st.spinner("填充中…（自动配钥匙 + 级联 + 值域确认）"):
                     _res2 = fill_multi(_tpl_df, key_cols=_tkeys, sources=_sources,
                                        mapping=_mapping2, col_threshold=float(_thr2),
                                        key_min=float(_kmin2), max_rounds=int(_rnd2),
                                     promote_min=float(_pmin2), auto_keys=bool(_autok2),
-                                    defer_single=bool(_def2), audit_rounds=int(_aud2),
-                                    audit_seed=int(_seed2), allow_domain=bool(_dom2),
+                                    defer_single=bool(_def2), allow_domain=bool(_dom2),
                                     experience=store, conventions=conv_store)
                 st.session_state["mf_res"] = _res2
             except Exception as e:
@@ -1061,7 +1056,6 @@ elif mode == "多表补全":
             _rv = _mfres["review"]
             _nd = _st2.get("需人工确认行数", 0)
             _nd_rows = int(_rv["行号"].nunique()) if len(_rv) else 0
-            _ad = _mfres.get("audit")
             _pt = _mfres.get("partial")
             _cx = _mfres.get("cross")
             _ch = _mfres.get("choices")
@@ -1126,26 +1120,38 @@ elif mode == "多表补全":
             # ---- 值域确认（只问值域；一次确认 → 整列类推，同类不再问）----
             _vqs = _mfres.get("value_questions") or []
             if _vqs:
-                st.markdown(f"### 🧩 值域确认（{len(_vqs)} 条，一次确认就整列类推，同类不再问）")
+                st.markdown(f"### 🧩 值域/列口径确认（{len(_vqs)} 条，一次确认就整列类推/配对生效）")
                 _ans_vq = {}
                 for _qi, _q in enumerate(_vqs):
                     _is_rule = (_q.get("类型") == "整列")
-                    _head = (f"**「{_q['列名']}」← {_q['源表']}.{_q['源列']}**"
-                             + (f"　规律：去掉共同修饰 + 数字互换（**整列 {_q['覆盖率']:.0f}% 通用**，"
-                                f"同类 {_q['同类数']} 条）" if _is_rule
-                                else f"　看着像，但不是规律能证的（相似度 {_q['相似度']}，同类 {_q['同类数']} 条）"))
-                    _ex = (f"例：模板「{_q['示例模板值']}」 ↔ 源「{_q['示例源表值']}」"
-                           f"｜模板还有：{'、'.join(str(x) for x in _q['模板前5'])}"
-                           f"｜源还有：{'、'.join(str(x) for x in _q['源前5'])}")
-                    _opts = (["就是同一个（按规律类推整列）", "不是，两回事", "暂不处理"] if _is_rule
-                             else ["就是同一个（只记这一对）", "不是，两回事", "暂不处理"])
+                    _is_col = (_q.get("类型") == "列口径")
+                    if _is_col:
+                        _head = (f"**「{_q['列名']}」← {_q['源表']} →【{_q['源列']}】**"
+                                 f"　表头对不上（不同名/级别不同），但**取值 {_q['覆盖率']:.0f}% 重合**"
+                                 f" → 是不是同一口径？")
+                        _ex = (f"例：模板「{_q['示例模板值']}」 ↔ 源「{_q['示例源表值']}」"
+                               f"｜模板还有：{'、'.join(str(x) for x in _q['模板前5'])}"
+                               f"｜源还有：{'、'.join(str(x) for x in _q['源前5'])}"
+                               f"　（确认后它能当**钥匙**用）")
+                        _opts = ["是同一口径（以后当钥匙）", "不是，两回事", "暂不处理"]
+                    else:
+                        _head = (f"**「{_q['列名']}」← {_q['源表']} →【{_q['源列']}】**"
+                                 + (f"　规律：去掉共同修饰 + 数字互换（**整列 {_q['覆盖率']:.0f}% 通用**，"
+                                    f"同类 {_q['同类数']} 条）" if _is_rule
+                                    else f"　看着像，但不是规律能证的（相似度 {_q['相似度']}）"))
+                        _ex = (f"例：模板「{_q['示例模板值']}」 ↔ 源「{_q['示例源表值']}」"
+                               f"｜模板还有：{'、'.join(str(x) for x in _q['模板前5'])}"
+                               f"｜源还有：{'、'.join(str(x) for x in _q['源前5'])}")
+                        _opts = (["就是同一个（按规律类推整列）", "不是，两回事", "暂不处理"] if _is_rule
+                                 else ["就是同一个（只记这一对）", "不是，两回事", "暂不处理"])
                     st.caption(_head)
                     st.caption(_ex)
                     _pickv = st.radio("怎么判？", _opts, index=2, horizontal=True,
                                       key=file_key("vq", _q["列名"], _q["源表"], _qi))
                     st.markdown("---")
                     _ans_vq[(_q["列名"], _q["源表"])] = {
-                        "ans": "same" if _pickv.startswith("就是同一个") else
+                        "type": _q.get("类型"), "src_col": _q.get("源列"),
+                        "ans": "same" if _pickv.startswith(("就是同一个", "是同一口径")) else
                                ("not" if _pickv.startswith("不是") else "skip"),
                         "rule": _q.get("规律")}
                 if st.button("✅ 确定并应用（写进口径本 → 立刻重跑）", type="primary", key="vq_apply"):
@@ -1157,8 +1163,7 @@ elif mode == "多表补全":
                                              mapping=_mapping2, col_threshold=float(_thr2),
                                              key_min=float(_kmin2), max_rounds=int(_rnd2),
                                              promote_min=float(_pmin2), auto_keys=bool(_autok2),
-                                             defer_single=bool(_def2), audit_rounds=int(_aud2),
-                                             audit_seed=int(_seed2), allow_domain=bool(_dom2),
+                                             defer_single=bool(_def2), allow_domain=bool(_dom2),
                                              experience=store, conventions=conv_store)
                         st.session_state["mf_res"] = _res_vq
                         st.rerun()
@@ -1200,8 +1205,7 @@ elif mode == "多表补全":
                 _fn2 = f"多表补全_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
                 _out2 = os.path.join(_OUT_DIR2, _fn2)
                 export_filled(_mfres["result"], _mfres["confidence"], _out2, stats=_st2,
-                              review_df=_mfres["review"], cross_df=_mfres.get("cross"),
-                              audit_df=_mfres.get("audit"))
+                              review_df=_mfres["review"], cross_df=_mfres.get("cross"))
                 with open(_out2, "rb") as _fh2:
                     st.download_button("⬇️ 下载补全表（带颜色与备注）", _fh2.read(), file_name=_fn2,
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

@@ -80,7 +80,7 @@ else:
     r = fill_multi(tpl, key_cols=keys,
                    sources=[{"name": "合约规划明细表", "df": src1},
                             {"name": "金蝶对账口径", "df": src2}])
-    res, st, rv, ad = r["result"], r["stats"], r["review"], r["audit"]
+    res, st, rv = r["result"], r["stats"], r["review"]
     BAD = ["未终止", "已终止", "已生效", "未生效", "未关闭", "已关闭", "冻结"]
 
     def vals(cols):
@@ -105,14 +105,50 @@ else:
           == st["模板行数"] * st["目标列数"])
     check("未匹配(留空) 不为负且 ≤ 留空合计",
           0 <= st["未匹配(留空)"] <= st["留空合计"])
-    check("清单只含「多候选 / 未补上」两类（复验明细另存）",
+    check("清单只含「多候选 / 未补上」两类",
           set(rv["类型"].astype(str).map(lambda s: s.split("(")[0])) <= {"多候选", "未补上"}
-          and "复验不一致" not in set(rv["类型"]))
+          )
     check("两源交叉核对：有可比格，且矛盾格数 ≤ 可比格（合同编号两源都供）",
           st["两源可核对格"] > 0 and 0 <= st["两源矛盾格"] <= st["两源可核对格"])
-    check("复验默认关（需显式开才跑）", st["复验组数"] == 0)
     check("85% 闸门：两表同名不同口径（起始日期 59%/合同编号 11%）→ 拒绝互补、不硬补",
           st["互补格数"] == 0 and len(st.get("拒绝互补列") or []) >= 1)
+
+    # ---- 验收：用户的真实痛点（钥匙少一把 → 多候选）----
+    # 金蝶有「合同二级分类」（表头 三级≠二级 被判冲突）但取值与模板「采购三级分类」高度重合
+    # → 工具应出「列口径」题；确认后它成为第 2 把钥匙 → 多候选应显著减少、对率不变
+    from core.conventions import ConventionStore
+    from core.table_filler import apply_col_answer
+    _cs = os.path.join(os.environ.get("TEMP", "."), "opencode", "conv_real3.json")
+    os.makedirs(os.path.dirname(_cs), exist_ok=True)
+    if os.path.exists(_cs):
+        os.remove(_cs)
+    cst = ConventionStore(_cs)
+    r2 = fill_multi(tpl, key_cols=keys, sources=[{"name": "合约规划明细表", "df": src1},
+                                                 {"name": "金蝶对账口径", "df": src2}],
+                    conventions=cst, key_min=80)
+    _qs = r2.get("value_questions") or []
+    _colq = [q for q in _qs if q.get("类型") == "列口径" and q.get("源表") == "金蝶对账口径"]
+    check("列口径题：金蝶「合同二级分类」被认出（表头冲突但值域重合）并出题问一次",
+          bool(_colq) and _colq[0]["源列"] == "合同二级分类")
+    _n_multi_before = int(r2["stats"]["歧义格数"])
+    if _colq:
+        apply_col_answer(tpl, [{"name": "金蝶对账口径", "df": src2}], _colq[0]["列名"],
+                         "金蝶对账口径", _colq[0]["源列"], "same", cst)
+    r3 = fill_multi(tpl, key_cols=keys, sources=[{"name": "合约规划明细表", "df": src1},
+                                                 {"name": "金蝶对账口径", "df": src2}],
+                    conventions=cst, key_min=80)
+    _keys_desc = dict(r3["stats"]["实际钥匙列"])
+    check("确认列口径后：金蝶的钥匙里出现「采购三级分类」（第二把钥匙生效）",
+          "采购三级分类" in str(_keys_desc.get("金蝶对账口径", "")))
+    _vq = [q for q in (r3.get("value_questions") or [])
+           if q.get("类型") == "整列" and q.get("列名") == "采购三级分类"]
+    check("配对后再出值域题：源值多出的后缀能学成规律（消防维保 ↔ 消防维保类采购合同）",
+          bool(_vq) and _vq[0]["覆盖率"] >= 60)
+    check("确认列口径后：歧义不增加（剩余歧义=源表自身多行/分类缺失，属无解）",
+          int(r3["stats"]["歧义格数"]) <= _n_multi_before)
+    check("确认列口径后：事业部填出的行数不减少（不因新增钥匙而退化）",
+          int((r3["result"]["事业部"].astype(str).str.strip() != "").sum()) >=
+          int((res["事业部"].astype(str).str.strip() != "").sum()))
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     lines = ["多表补全 · 真实三文件回归",
@@ -127,12 +163,11 @@ else:
     lines += ["", "【统计】"]
     for k in ("完全匹配(100%)", "高置信(80-99%)", "中置信(40-80%)", "低置信(20-40%)",
               "未匹配(留空)", "留空合计", "歧义格数", "需人工确认行数",
-              "复验组数", "复验可比格", "复验不一致格", "复验一致率"):
+              ):
         lines.append(f"  {k} = {st.get(k)}")
     lines += ["", f"【需人工确认】{len(rv)} 行（多候选/未补上）"]
     for _, row in rv.head(20).iterrows():
         lines.append(f"  {row['类型']}｜行{row['行号']}｜{row['列名']}｜{row['钥匙值']}")
-    lines += ["", f"【复验存疑明细】{len(ad)} 格（预期差异，一般不用看）"]
     with open(OUT, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     check("报告已生成", os.path.exists(OUT))

@@ -74,7 +74,7 @@ tpl3 = pd.DataFrame({"项目": ["天河项目"], "值": [""]})
 src3 = {"name": "s3", "df": pd.DataFrame({"项目": ["天河边检站项目", "别的项目"],
                                           "值": ["V1", "V2"]})}
 r3 = fill_multi(tpl3, key_cols=["项目"], sources=[src3], experience=fresh_store(),
-                auto_keys=False, key_min=95, audit_rounds=0)
+                auto_keys=False, key_min=95)
 ch3 = r3["choices"]
 check("未补上：给出最接近候选（含相似度备注）",
       len(ch3) == 1 and ch3["类型"].iloc[0] == "最接近候选"
@@ -82,17 +82,17 @@ check("未补上：给出最接近候选（含相似度备注）",
       and str(ch3["候选1"].iloc[0]) == "V1")
 check("未补上：门槛放低后同一条能自动配上（说明候选只是线索）",
       str(fill_multi(tpl3, key_cols=["项目"], sources=[src3], auto_keys=False,
-                     key_min=20, audit_rounds=0)["result"]["值"].iloc[0]) == "V1")
+                     key_min=20)["result"]["值"].iloc[0]) == "V1")
 
 # ---- ③ 抽查表：非 100% 的格要列出来（模糊命中）；经验库=100% 不列 ----
 tpl4 = pd.DataFrame({"钥匙": ["A公司"], "值": [""]})
 src4 = {"name": "s4", "df": pd.DataFrame({"钥匙": ["A公司集团"], "值": ["Z"]})}
-r4 = fill_multi(tpl4, key_cols=["钥匙"], sources=[src4], key_min=30, audit_rounds=0)
+r4 = fill_multi(tpl4, key_cols=["钥匙"], sources=[src4], key_min=30)
 pt = r4["partial"]
 check("抽查表：模糊补出的格（非100%）被列出",
       len(pt) == 1 and str(pt["值"].iloc[0]) == "Z"
       and str(r4["confidence"]["值"].iloc[0]).split(":")[0] != "ok")
-r4b = fill_multi(tpl, key_cols=["钥匙"], sources=[src], experience=store, audit_rounds=0)
+r4b = fill_multi(tpl, key_cols=["钥匙"], sources=[src], experience=store)
 check("抽查表：经验库命中(100%)不进抽查表", len(r4b["partial"]) == 0)
 
 if os.path.exists(TMP_STORE):

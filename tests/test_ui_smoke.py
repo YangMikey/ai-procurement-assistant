@@ -51,7 +51,7 @@ check("UI：源表选择 raw_quotes 后无异常", len(at.exception) == 0 and no
 has_supply = any("列供给" in str(x.value or "") for x in at.markdown) or len(at.selectbox) > 0
 check("UI：列供给区渲染成功（含候选标签路径）", has_supply)
 
-# 新开关（自动配钥匙 / 值域识别 / 单钥匙延后 / 复验组数）开→关各渲染一次
+# 新开关（自动配钥匙 / 值域识别 / 单钥匙延后）开→关各渲染一次
 for _k, _vals in (("mf_autokey", [False, True]), ("mf_domain", [False, True]),
                   ("mf_defer", [False, True])):
     for _v in _vals:
@@ -61,14 +61,6 @@ for _k, _vals in (("mf_autokey", [False, True]), ("mf_domain", [False, True]),
             pass
         at.run()
         check(f"UI：{_k}={_v} 渲染无异常", len(at.exception) == 0 and not at.error)
-try:
-    at.slider(key="mf_audit").set_value(0)
-    at.run()
-    check("UI：复验组数=0 渲染无异常", len(at.exception) == 0 and not at.error)
-    at.slider(key="mf_audit").set_value(2)
-    at.run()
-except Exception:
-    pass
 
 # 真跑一次「生成补全表」：走完 自动配钥匙 → 级联 → 清单 → 抽查区 全链路
 if at.button(key="mf_go"):

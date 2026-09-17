@@ -60,11 +60,11 @@ check("一致率：换算后一致",
 # ---- ③ 端到端：开口径本 → 从"留空"变成"100% 精确命中" ----
 tpl = pd.DataFrame({"钥匙事业部": ["1事业部", "2事业部"], "值": ["", ""]})
 src = {"name": "srcA", "df": pd.DataFrame({"钥匙事业部": ["一", "二"], "值": ["A1", "A2"]})}
-r0 = fill_multi(tpl, key_cols=["钥匙事业部"], sources=[src], audit_rounds=0)
+r0 = fill_multi(tpl, key_cols=["钥匙事业部"], sources=[src])
 check("不开口径本：1事业部 vs 一 没有共同字符 → 宁可留空",
       str(r0["result"]["值"].iloc[0]).strip() == "")
 st = store()
-r1 = fill_multi(tpl, key_cols=["钥匙事业部"], sources=[src], audit_rounds=0, conventions=st)
+r1 = fill_multi(tpl, key_cols=["钥匙事业部"], sources=[src], conventions=st)
 check("开口径本：自动学到等价 → 两行都 100% 精确命中",
       list(r1["result"]["值"]) == ["A1", "A2"]
       and all("100" in str(v) for v in r1["confidence"]["值"]))
@@ -80,7 +80,7 @@ _sA = {"name": "源A", "df": pd.DataFrame({"钥匙": _keys,
 _sB = {"name": "源B", "df": pd.DataFrame({"钥匙": _keys,
                                           "值": [f"X{i}" if i <= 6 else f"Y{i}"
                                                  for i in range(1, 13)]})}
-_rG = fill_multi(_tG, key_cols=["钥匙"], sources=[_sA, _sB], audit_rounds=0, key_min=95,
+_rG = fill_multi(_tG, key_cols=["钥匙"], sources=[_sA, _sB], key_min=95,
                  mapping={"值": (0, "值")})       # 手动指定源A为首选（分 101）
 check("闸门：一致率 50% <85%（重叠 12 行）→ 判两套口径、拒绝互补",
       _rG["stats"]["互补格数"] == 0 and len(_rG["stats"]["拒绝互补列"]) >= 1)
@@ -91,7 +91,7 @@ _sC = {"name": "源C", "df": pd.DataFrame({"钥匙": _keys2[:11],
                                           "值": [f"V{i}" for i in range(1, 12)]})}
 _sD = {"name": "源D", "df": pd.DataFrame({"钥匙": _keys2,
                                           "值": [f"V{i}" for i in range(1, 13)]})}
-_rH = fill_multi(_tH, key_cols=["钥匙"], sources=[_sC, _sD], audit_rounds=0, key_min=95,
+_rH = fill_multi(_tH, key_cols=["钥匙"], sources=[_sC, _sD], key_min=95,
                  mapping={"值": (0, "值")})       # 首选源C（它缺 m12）
 check("闸门：一致率 100% → 允许互补（m12 由次选列补上）",
       str(_rH["result"]["值"].iloc[11]) == "V12" and _rH["stats"]["互补格数"] >= 1)
@@ -117,7 +117,7 @@ check("问题清单：只出一题、类型=整列、示例对正确（不是 3�
 _ap = apply_value_answers(tplQ, [srcQ], {("钥匙事业部", "srcQ"): {"ans": "same", "rule": qs[0]["规律"]}},
                           stQ)
 check("应用：整列类推（一条回答解决一类）", _ap and _ap[0][0] == "类推整列")
-_rQ = fill_multi(tplQ, key_cols=["钥匙事业部"], sources=[srcQ], audit_rounds=0, conventions=stQ)
+_rQ = fill_multi(tplQ, key_cols=["钥匙事业部"], sources=[srcQ], conventions=stQ)
 check("类推后：三行全部 100% 精确命中（不再有非100%）",
       list(_rQ["result"]["值"]) == ["A1", "A2", "A3"]
       and all("ok:100" in str(x) for x in _rQ["confidence"]["值"]))
@@ -136,12 +136,10 @@ check("问题清单：看着像但不是的（57 分）也给出来让你判",
 apply_value_answers(tplN, [srcN], {("项目", "srcN"): "not"}, stN)
 check("判不同：已记住", stN.stats()["判定不同"] >= 1)
 check("判不同后：该格不再模糊填（留空）",
-      str(fill_multi(tplN, key_cols=["项目"], sources=[srcN], audit_rounds=0,
-                     conventions=stN)["result"]["值"].iloc[0]).strip() == "")
+      str(fill_multi(tplN, key_cols=["项目"], sources=[srcN], conventions=stN)["result"]["值"].iloc[0]).strip() == "")
 check("判不同：已记住", stN.stats()["判定不同"] >= 1)
 check("判不同后：该格不再模糊填（留空）",
-      str(fill_multi(tplN, key_cols=["项目"], sources=[srcN], audit_rounds=0,
-                     conventions=stN)["result"]["值"].iloc[0]).strip() == "")
+      str(fill_multi(tplN, key_cols=["项目"], sources=[srcN], conventions=stN)["result"]["值"].iloc[0]).strip() == "")
 
 if os.path.exists(TMP):
     os.remove(TMP)

@@ -119,6 +119,33 @@ def learn_value_equiv(a_vals, b_vals, min_uniq=2, max_uniq=200):
     return {"ok": True, "mapping": mapping, "reason": f"核心一一对应（{len(mapping)} 条）"}
 
 
+def domain_overlap(a_vals, b_vals, cover=0.75, limit=2000):
+    """值域"像不像"（容忍包含/去修饰）：返回 (ok, 双向覆盖率)。
+
+    匹配规则（任一成立即算对上）：canon 后相等；或一方是另一方的**子串**（含前后缀差）。
+    例：`消防维保类采购合同` ⊃ `消防维保` ✓
+    """
+    A, B = _uniq(a_vals, limit), _uniq(b_vals, limit)
+    if not A or not B:
+        return False, 0.0
+    ca = {v: canon(v) for v in A}
+    cb = {v: canon(v) for v in B}
+    bset = list(cb.values())
+
+    def hit(x, pool):
+        if x in pool:
+            return True
+        for y in pool:
+            if x and y and (x in y or y in x):
+                return True
+        return False
+
+    a_ok = sum(1 for v in ca.values() if hit(v, bset)) / len(ca)
+    b_ok = sum(1 for v in cb.values() if hit(v, list(ca.values()))) / len(cb)
+    ok = a_ok >= cover and b_ok >= cover
+    return ok, min(a_ok, b_ok)
+
+
 # ---------- 规律推断与类推（让"确认一条 = 解决一类"） ----------
 
 def _lcp(a, b):
@@ -154,7 +181,36 @@ def infer_rule(a, b):
         return {"kind": "drop_head", "n": len(a2) - len(b2)}
     if a2.startswith(b2) and len(a2) > len(b2):
         return {"kind": "drop_tail", "n": len(a2) - len(b2)}
+    # 源值比模板值"多"一截（如 消防维保 → 消防维保类采购合同）→ 按 token 学（长度会变）
+    if b2.startswith(a2) and len(b2) > len(a2):
+        return {"kind": "strip_src_tail"}
+    if b2.endswith(a2) and len(b2) > len(a2):
+        return {"kind": "strip_src_head"}
     return None
+
+
+def _derive_strip_tokens(a_vals, b_vals, side="tail", max_len=8):
+    """从**整列**学"源值多出的那截"token 集合（如 采购合同 / 类采购合同）。
+
+    返回 (tokens, 命中模板值数, 能被解释的源值数)。
+    """
+    Aset = {canon(a) for a in _uniq(a_vals)}
+    tokens, hitA, hitB = set(), set(), 0
+    for b in _uniq(b_vals):
+        cb = canon(b)
+        if cb in Aset:
+            hitA.add(cb)
+            hitB += 1
+            continue
+        for n in range(1, min(max_len, len(cb) - 1) + 1):
+            core = cb[: len(cb) - n] if side == "tail" else cb[n:]
+            tok = cb[len(cb) - n:] if side == "tail" else cb[:n]
+            if core in Aset:
+                tokens.add(tok)
+                hitA.add(core)
+                hitB += 1
+                break
+    return tokens, len(hitA), hitB
 
 
 def apply_rule_tpl(rule, v):
@@ -177,35 +233,62 @@ def apply_rule_tpl(rule, v):
 
 
 def apply_rule_src(rule, v):
-    """源表侧 → 可比核心（numeral 规律与模板侧同样处理；drop_* 规律源侧保持原样）。"""
+    """源表侧 → 可比核心：numeral 同模板侧；drop_* 保持；strip_src_* 去掉学到的 token。"""
     s = norm_text(v)
-    k = (rule or {}).get("kind")
+    r = rule or {}
+    k = r.get("kind")
     if k == "numeral":
-        pre, suf = rule.get("prefix") or "", rule.get("suffix") or ""
+        pre, suf = r.get("prefix") or "", r.get("suffix") or ""
         if pre and s.startswith(pre):
             s = s[len(pre):]
         if suf and s.endswith(suf):
             s = s[: len(s) - len(suf)]
         return _cn_number(s)
+    if k == "strip_src_tail":
+        for tok in (r.get("tokens") or []):
+            if tok and s.endswith(tok) and len(s) > len(tok):
+                return s[: len(s) - len(tok)]
+        return s
+    if k == "strip_src_head":
+        for tok in (r.get("tokens") or []):
+            if tok and s.startswith(tok) and len(s) > len(tok):
+                return s[len(tok):]
+        return s
     return s
 
 
-def verify_rule(rule, a_vals, b_vals, cover=0.9):
-    """规律能否解释**整列**：双向覆盖 ≥cover 且保持区分度（不同值不塌缩）。
+def verify_rule(rule, a_vals, b_vals, cover=0.6):
+    """规律能否解释**整列**：**模板值去修饰后能在源列里找到**（单向 ≥cover）+ 保持区分度。
 
-    返回 (ok, 覆盖率, 说明)。**这是"类推"能不能成立的唯一依据**。
+    返回 (ok, 覆盖率, 说明, 补全后的规则)。**这是"类推"能不能成立的唯一依据**。
+    - numeral：双向覆盖（两边都要能对上）
+    - strip_src_*：从整列**学 token 集合**（采购合同/类采购合同），再加单向覆盖
     """
     A, B = _uniq(a_vals), _uniq(b_vals)
     if not A or not B:
-        return False, 0.0, "空列"
+        return False, 0.0, "空列", rule
+    k = (rule or {}).get("kind")
+    if k in ("strip_src_tail", "strip_src_head"):
+        side = "tail" if k == "strip_src_tail" else "head"
+        tokens, hitA, _hitB = _derive_strip_tokens(A, B, side=side)
+        if not tokens:
+            return False, 0.0, "学不到可用的尾巴/前缀 token", rule
+        cov = hitA / len(A)
+        ok = cov >= cover
+        r2 = dict(rule); r2["tokens"] = sorted(tokens)
+        return ok, cov, (f"token={'、'.join(r2['tokens'])}，模板覆盖 {cov:.0%}" if ok
+                         else f"覆盖率不足（{cov:.0%}）"), r2
     ta = {v: apply_rule_tpl(rule, v) for v in A}
     tb = {v: apply_rule_src(rule, v) for v in B}
     if len(set(ta.values())) != len(ta) or len(set(tb.values())) != len(tb):
-        return False, 0.0, "会把不同值并成一个（禁止）"
+        return False, 0.0, "会把不同值并成一个（禁止）", rule
     sa, sb = set(ta.values()), set(tb.values())
     ca, cb = len(sa & sb) / len(sa), len(sa & sb) / len(sb)
-    ok = ca >= cover and cb >= cover
-    return ok, min(ca, cb), ("通过" if ok else f"覆盖率不足（{ca:.0%} / {cb:.0%}）")
+    if k == "numeral":
+        ok = ca >= cover and cb >= cover
+        return ok, min(ca, cb), ("通过" if ok else f"覆盖率不足（{ca:.0%} / {cb:.0%}）"), rule
+    ok = ca >= cover
+    return ok, ca, ("通过" if ok else f"覆盖率不足（{ca:.0%}）"), rule
 
 
 def agreement(vals_a, vals_b, mapping=None):
@@ -268,6 +351,18 @@ class ConventionStore:
             "verdict": verdict, "src": src}
         self._save()
         return self.data["col_verdicts"][key]
+
+    # ---------- 列配对（人工确认过的"这一列就是那一列"） ----------
+    def col_pair(self, tpl_col, src_name):
+        tag = f"{tpl_col}|{src_name}"
+        return (self.data.get("col_pairs") or {}).get(tag)
+
+    def record_col_pair(self, tpl_col, src_name, src_col, src="manual", evidence=""):
+        tag = f"{tpl_col}|{src_name}"
+        self.data.setdefault("col_pairs", {})[tag] = {
+            "tpl": tpl_col, "src": src_name, "col": src_col, "src_kind": src, "evidence": evidence}
+        self._save()
+        return self.data["col_pairs"][tag]
 
     # ---------- 值级 ----------
     def value_rules(self, *scope):
@@ -333,6 +428,7 @@ class ConventionStore:
 
     def stats(self):
         return {"列级结论": len(self.data.get("col_verdicts") or {}),
+                "列配对": len(self.data.get("col_pairs") or {}),
                 "值等价组": len(self.data.get("value_equiv") or []),
                 "类推规律": len(self.data.get("value_rules") or []),
                 "判定不同": len(self.data.get("not_same") or {}),
