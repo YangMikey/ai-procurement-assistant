@@ -68,7 +68,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.08"
+BUILD = "2026-09-15.09"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -981,7 +981,7 @@ elif mode == "多表补全":
             if _df2 is None or not len(_df2.columns):
                 continue
             st.caption(f"可用列：{'、'.join(str(c) for c in _df2.columns)}")
-            _sources.append({"name": _nm, "df": _df2})
+            _sources.append({"name": _nm, "df": _df2, "sheet": _sh2})
 
     if _tpl_df is not None and len(_tpl_df.columns) and _sources:
         st.subheader("③ 列供给（自动发现，可改）")
@@ -1017,14 +1017,14 @@ elif mode == "多表补全":
             pass
 
         from core.table_filler import all_supply_options as _allopt
+        from core.table_filler import supply_option_label as _lbl2
         _tcols2 = [c for c in _tpl_df.columns if c not in _tkeys]
         _mapping2 = {}
         st.caption("下拉里**列出所有源表的所有列**（含 0 分，由你判断）；排序只是参考，不筛列。")
         for _tcol in _tcols2:
             _opts_raw = _allopt(_tcol, _sources, float(_thr2), _mapping2, conv_store)
             _labels = ["不补"] + [
-                f"{_s['name']} →【{_c['col']}】({_c['how']},{_c['score']:.0f}｜有值 {_c['filled']})"
-                for _c in _opts_raw]
+                f"{_lbl2(_c, _sources)}｜有值 {_c['filled']}" for _c in _opts_raw]
             _def = 1 if _opts_raw else 0
             _pickc2 = st.selectbox(f"「{_tcol}」←", _labels, index=_def,
                                    key=file_key("mfmap", _tcol, _thr2))

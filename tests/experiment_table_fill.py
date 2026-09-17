@@ -193,6 +193,22 @@ check("列供给标签：用源表名格式且不报错",
       len(_lbls) >= 1 and all("【" in x and "(" in x for x in _lbls)
       and any(x.startswith("源B") for x in _lbls))
 
+# 回归：标签必须按候选自带的 source 索引取表名（曾有 bug：用了循环遗留变量 → 全写成最后一张表）
+_sheet_a = pd.DataFrame({"项目名称": ["P1", "P2"], "起始日期": ["2026-01-01", "2026-02-01"]})
+_sheet_b = pd.DataFrame({"项目名称": ["P1"], "起始日期": ["2026-03-01"]})
+_src_sheet = [{"name": "合约规划明细表", "df": _sheet_a, "sheet": "合约规划明细表 (4-12月)"},
+              {"name": "金蝶对账", "df": _sheet_b, "sheet": "sheet1"}]
+_sup3 = discover_supply(["起始日期"], _src_sheet, 70)
+_lbl3 = [supply_option_label(c, _src_sheet) for c in _sup3["起始日期"]]
+check("列供给标签：多源各带各的表名（不再张冠李戴）",
+      any(x.startswith("合约规划明细表") for x in _lbl3)
+      and any(x.startswith("金蝶对账") for x in _lbl3))
+check("列供给标签：同一目标列的两个来源都列出（915/199 场景）", len(_lbl3) == 2)
+check("列供给标签：附工作表名（多 sheet 文件可分辨）",
+      all("〔" in x for x in _lbl3))
+_miss = supply_option_label({"source": 99, "col": "X", "how": "同名", "score": 100}, _src_sheet)
+check("列供给标签：越界 source 不崩（回退 ?）", _miss.startswith("?"))
+
 # ================= 新增：自动配钥匙（值域/同义/择优/延后/两源交叉） =================
 from core.table_filler import pair_col, plan_keys, value_domain_sim
 

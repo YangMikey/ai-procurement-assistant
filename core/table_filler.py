@@ -1470,10 +1470,16 @@ def preview_keys(template_keys, sources, col_threshold=COL_DEFAULT_THRESHOLD,
 
 
 def supply_option_label(cand, sources):
-    """「列供给」下拉标签：源表名【源列】(匹配方式,分数)。（候选字典无 name 字段，需查 sources）"""
+    """「列供给」下拉标签：源表名〔工作表〕→【源列】(匹配方式,分数)。
+
+    注意：源表名**必须**按 cand["source"] 去查（候选字典里没有 name 字段）。
+    """
     si = cand.get("source", 0)
-    sname = sources[si]["name"] if isinstance(si, int) and 0 <= si < len(sources) else "?"
-    return f"{sname}【{cand.get('col', '')}】({cand.get('how', '')},{cand.get('score', 0):.0f})"
+    src = sources[si] if isinstance(si, int) and 0 <= si < len(sources) else {}
+    sname = src.get("name", "?")
+    sheet = src.get("sheet")
+    head = f"{sname}〔{sheet}〕" if sheet else f"{sname}"
+    return f"{head} →【{cand.get('col', '')}】({cand.get('how', '')},{cand.get('score', 0):.0f})"
 
 
 def discover_supply(tpl_cols, sources, col_threshold=COL_DEFAULT_THRESHOLD, mapping=None):

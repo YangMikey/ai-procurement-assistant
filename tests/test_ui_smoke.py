@@ -51,6 +51,15 @@ check("UI：源表选择 raw_quotes 后无异常", len(at.exception) == 0 and no
 has_supply = any("列供给" in str(x.value or "") for x in at.markdown) or len(at.selectbox) > 0
 check("UI：列供给区渲染成功（含候选标签路径）", has_supply)
 
+# 回归：列供给标签必须走 supply_option_label（源表名〔工作表〕 →【源列】）
+# 曾经的 bug：内联 f-string 用了循环遗留变量 _s → 所有选项都写成最后一张源表名
+_sb_sup = [sb for sb in at.selectbox
+           if str(sb.label).startswith("「") and str(sb.label).endswith("←")]
+check("UI：列供给下拉存在", len(_sb_sup) >= 1)
+_opt_sup = [o for sb in _sb_sup for o in list(sb.options or []) if o != "不补"]
+check("UI：列供给标签带「工作表」且格式为 源表 →【源列】",
+      len(_opt_sup) >= 1 and all("〔" in o and " →【" in o for o in _opt_sup))
+
 # 新开关（自动配钥匙 / 值域识别 / 单钥匙延后）开→关各渲染一次
 for _k, _vals in (("mf_autokey", [False, True]), ("mf_domain", [False, True]),
                   ("mf_defer", [False, True])):
