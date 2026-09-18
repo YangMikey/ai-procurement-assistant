@@ -271,6 +271,35 @@ check("两源矛盾照常：不一致 → 进矛盾清单、不升级、保持�
       "双源印证" not in str(_r7b["confidence"].at[1, "服务费"])
       and _r7b["stats"]["两源矛盾格"] >= 1)
 
+# ---- 链式印证：精确命中 + 所用钥匙格全部可信 → 继承印证升 100（复刻"单源列级联1跳"场景）----
+# S2 同名两行事业部不同 → 只用项目名称是歧义（留空）；第2轮靠补出的合同编号消歧 → 90%
+# 链头（合同编号，第1轮由 S1 精确填出）可信 → 继承印证升 100
+_tpl8 = pd.DataFrame({"项目名称": ["保利花园"], "采购三级分类": ["绿化养护"],
+                      "合同编号": [""], "事业部": [""]})
+_s8a = pd.DataFrame({"项目名称": ["保利花园"], "采购三级分类": ["绿化养护"], "合同编号": ["CT-A"]})
+_s8b = pd.DataFrame({"项目名称": ["保利花园", "保利花园"],
+                     "合同编号": ["CT-A", "CT-B"], "事业部": ["甲部", "乙部"]})
+_r8 = fill_multi(_tpl8, key_cols=["项目名称", "采购三级分类"],
+                 sources=[{"name": "S1", "df": _s8a}, {"name": "S2", "df": _s8b}])
+check("链式印证：级联1跳(90%) + 链头(合同编号)可信 → 自动升 100 无色",
+      str(_r8["confidence"].at[0, "事业部"]).startswith("ok")
+      and "链式印证" in str(_r8["confidence"].at[0, "事业部"])
+      and _r8["stats"]["链式印证格数"] >= 1)
+
+_s8c = pd.DataFrame({"项目名称": ["保利花园城"], "采购三级分类": ["绿化养护"], "合同编号": ["CT-A"]})
+_r8b = fill_multi(_tpl8, key_cols=["项目名称", "采购三级分类"],
+                  sources=[{"name": "S1", "df": _s8c}, {"name": "S2", "df": _s8b}])
+check("链头模糊(90%)不可信 → 不继承，保持黄色（人看）",
+      str(_r8b["confidence"].at[0, "事业部"]).startswith("high")
+      and "链式印证" not in str(_r8b["confidence"].at[0, "事业部"]))
+
+_tpl9 = pd.DataFrame({"项目名称": ["保利花园"], "事业部": [""]})
+_s9 = pd.DataFrame({"项目名称": ["保利花园城"], "事业部": ["甲部"]})
+_r9 = fill_multi(_tpl9, key_cols=["项目名称"], sources=[{"name": "S2", "df": _s9}])
+check("模糊命中（匹配分<100）永不继承（保持黄色）",
+      str(_r9["confidence"].at[0, "事业部"]).startswith("high")
+      and "链式印证" not in str(_r9["confidence"].at[0, "事业部"]))
+
 
 # ================= 新增：自动配钥匙（值域/同义/择优/延后/两源交叉） =================
 from core.table_filler import pair_col, plan_keys, value_domain_sim
@@ -319,9 +348,10 @@ _rE2 = fill_multi(_tE, key_cols=["项目名称"], sources=[{"name": "e1", "df": 
                                                       {"name": "e2", "df": _se2}],
                   defer_single=True, max_rounds=4)
 check("表级延后：单钥匙源表被延后（计数 ≥1）", _rE2["stats"]["延后源表数"] >= 1)
-check("表级延后：第 2 轮凑到两把钥匙后才补（金额正确、备注含 2钥匙）",
+check("表级延后：第 2 轮凑到两把钥匙后才补（金额正确、备注含 2钥匙或已链式印证）",
       list(_rE2["result"]["金额"]) == ["11", "22"]
-      and "2钥匙" in str(_rE2["confidence"].loc[0, "金额"]))
+      and ("2钥匙" in str(_rE2["confidence"].loc[0, "金额"])
+           or "链式印证" in str(_rE2["confidence"].loc[0, "金额"])))
 
 # --- 表级延后：始终只有 1 把 → 仍按 1 把匹配（不是留空）---
 _tF = pd.DataFrame({"项目名称": ["Q1"], "金额": [""]})

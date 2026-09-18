@@ -923,6 +923,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     result = template_df.copy()
     conf = pd.DataFrame("", index=template_df.index, columns=list(result.columns))
     filled = {}          # (i, col) -> (decayed_score, 有效轮次, k_used, tie_n)
+    hit_trust = {}       # (i, col) -> (匹配分, used_tks)：链式印证用（精确命中 + 钥匙格可信 → 继承）
     gen = {}             # (i, col) -> 生成代：原值=0；用原值补出=1；用补出值再补=2…
     idx_cache = {}
     n_fill = {"ok": 0, "high": 0, "mid": 0, "low": 0, "miss": 0}
@@ -1266,6 +1267,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     result.at[i, tcol] = _norm_value(v)
                     tie_cells.pop((i, tcol), None)     # 之前判过"多候选"的格，这轮补上了 → 撤掉标记
                     filled[(i, tcol)] = (decayed, 0, k_used, tie_n)   # 轮次稍后回填
+                    hit_trust[(i, tcol)] = (sc, used_tks)   # 链式印证：匹配分 + 用了哪几把钥匙
                     gen[(i, tcol)] = g + 1
                     n_fill[_band(decayed)] += 1
                     round_fills.append((i, tcol, decayed, k_used, tie_n, s_name))
@@ -1396,6 +1398,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     if not pairs:
                         continue
                     m = _match_source(s, pairs, final_avail[i], key_min, ccol, idx_cache,
+                                      blank_on_tie=True,
                                       norm_fn=nf_per_src[si][0], norm_fn_src=nf_per_src[si][1],
                                       sib=sib_per_src[si])
                     if not m or m[0] is None:
@@ -1447,6 +1450,47 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
         conf.at[i, tcol] = f"ok:100@{old[1]}·双源印证"
         n_confirm += 1
 
+    # ---- 链式印证（A 案）：把"已验证"沿接力链传下去 ----
+    # 条件（全部满足才继承）：该格是**精确命中**（匹配分=100，折减只来自跳数）
+    # + 所用每一把钥匙格都可信（模板原有值 / 已填且为 ok 档：双源印证·精确·经验库·链式）
+    # + 不在两源矛盾清单里。模糊命中（匹配分<100）= 可能配错行 → **永不继承**，必须人看。
+    n_chain = 0
+    _bad_cells = {(int(b.get("行号", 0)) - 2, b.get("列名")) for b in cross["矛盾"]}
+    _changed = True
+    while _changed:
+        _changed = False
+        for (i, tcol) in list(filled.keys()):
+            cur = filled[(i, tcol)]
+            if _band(cur[0]) == "ok":
+                continue
+            if (i, tcol) not in hit_trust:
+                continue
+            sc_m, used_tks = hit_trust[(i, tcol)]
+            if sc_m < 100.0 - 1e-9:
+                continue                      # 模糊命中 → 永不继承
+            if (i, tcol) in _bad_cells:
+                continue                      # 两源矛盾过 → 不继承
+            _trusted = True
+            for tk in used_tks:
+                if tk not in template_df.columns:
+                    _trusted = False
+                    break
+                if _has_value(template_df.at[i, tk]):
+                    continue                  # 模板原有值 → 可信
+                _kcell = filled.get((i, tk))
+                if _kcell is None or _band(_kcell[0]) != "ok":
+                    _trusted = False          # 钥匙格不可信 → 不继承
+                    break
+            if not _trusted:
+                continue
+            b0 = _band(cur[0])
+            n_fill[b0] = max(0, n_fill[b0] - 1)
+            n_fill["ok"] += 1
+            filled[(i, tcol)] = (100.0, cur[1], cur[2], cur[3])
+            conf.at[i, tcol] = f"ok:100@{cur[1]}·链式印证"
+            n_chain += 1
+            _changed = True
+
     # ---- 需人工确认清单：只收「必看」（多候选留空 / 未补上）----
     review = []
     for (i, tcol), (tn, k_used, _how, _cv, _sn, _scol) in tie_cells.items():
@@ -1497,6 +1541,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
              "延后源表数": len(deferred_sources),
              "经验库命中": n_exp,
              "双源印证格数": n_confirm,
+             "链式印证格数": n_chain,
             "非100%格数": n_fill["high"] + n_fill["mid"] + n_fill["low"],
             "值等价学习(条)": n_equiv, "互补格数": n_complement,
             "拒绝互补列": list(gate_blocked), "口径说明": list(equiv_notes),
@@ -1857,6 +1902,9 @@ def legend_lines(stats):
         extra.append(f"含 {stats['间接补全格数']} 格为多轮间接补全（置信已按跳数折减）")
     if stats.get("双源印证格数"):
         extra.append(f"双源印证 {stats['双源印证格数']} 格：两张源表**独立**命中且一致 → 已按完全匹配(100%)计")
+    if stats.get("链式印证格数"):
+        extra.append(f"链式印证 {stats['链式印证格数']} 格：精确命中且所用钥匙格全部可信（沿接力链继承印证）"
+                     "→ 已按完全匹配(100%)计")
     if stats.get("歧义格数"):
         extra.append(f"有 {stats['歧义格数']} 格命中多行且取值不同 → **已留空**（见「需人工确认」清单，选一条填）")
     if stats.get("延后源表数"):
@@ -1892,6 +1940,8 @@ def _conf_comment(tag):
     for p in parts[1:]:
         if p == "双源印证":
             bits.append("双源印证（两张源表独立命中且一致）")
+        elif p == "链式印证":
+            bits.append("链式印证（精确命中且所用钥匙格全部可信）")
         elif p == "经验库":
             bits.append("你之前人工确认过")
         elif p.endswith("钥匙"):
@@ -1931,7 +1981,7 @@ def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, re
             band = tag.split(":")[0]
             spec = COLORS.get(band)
             if not spec or not spec["fill"]:
-                if "双源印证" in tag:
+                if "双源印证" in tag or "链式印证" in tag:
                     ws.cell(row=r, column=c).comment = Comment(_conf_comment(tag), "AI采购助理")
                 continue
             cell = ws.cell(row=r, column=c)
