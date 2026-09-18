@@ -61,8 +61,9 @@ check("一致率：换算后一致",
 tpl = pd.DataFrame({"钥匙事业部": ["1事业部", "2事业部"], "值": ["", ""]})
 src = {"name": "srcA", "df": pd.DataFrame({"钥匙事业部": ["一", "二"], "值": ["A1", "A2"]})}
 r0 = fill_multi(tpl, key_cols=["钥匙事业部"], sources=[src])
-check("不开口径本：1事业部 vs 一 没有共同字符 → 宁可留空",
-      str(r0["result"]["值"].iloc[0]).strip() == "")
+check("canon 默认启用：不开口径本 1事业部 = 一 也直接精确命中（2026-09-17 起默认归一）",
+      list(r0["result"]["值"]) == ["A1", "A2"]
+      and all("100" in str(v) for v in r0["confidence"]["值"]))
 st = store()
 r1 = fill_multi(tpl, key_cols=["钥匙事业部"], sources=[src], conventions=st)
 check("开口径本：自动学到等价 → 两行都 100% 精确命中",
@@ -97,29 +98,41 @@ check("闸门：一致率 100% → 允许互补（m12 由次选列补上）",
       str(_rH["result"]["值"].iloc[11]) == "V12" and _rH["stats"]["互补格数"] >= 1)
 
 # ---- ⑤ 值域问题清单 + 一条回答解决一类（**必须类推**）----
-_AA = ["1事业部", "2事业部", "3事业部"]
-_BB = ["一事业部", "二事业部", "三事业部"]
+# canon 默认启用后，1/2/3事业部 ↔ 一/二/三事业部 这类**自动命中**、不再出题；
+# 出题机制改用 canon 解决不了的例子（源值多出一截「类采购合同」）
+_AA = ["消防维保"]
+_BB = ["消防维保类采购合同"]
+_AA3 = ["1事业部", "2事业部", "3事业部"]
+_BB3 = ["一事业部", "二事业部", "三事业部"]
 check("规律：从 2事业部↔二事业部 推出 numeral 规律", infer_rule("2事业部", "二事业部") ==
       {"kind": "numeral", "prefix": "", "suffix": "事业部"})
-check("规律自证：整列通用（覆盖 100%）", verify_rule(infer_rule("2事业部", "二事业部"), _AA, _BB)[0])
+check("规律自证：整列通用（覆盖 100%）", verify_rule(infer_rule("2事业部", "二事业部"), _AA3, _BB3)[0])
 check("规律守卫：会把不同值并成一个 → 拒绝",
       not verify_rule({"kind": "drop_head", "n": 3}, ["广州科汇", "深圳科汇"], ["科汇", "科汇"])[0])
 
-tplQ = pd.DataFrame({"钥匙事业部": _AA, "值": ["", "", ""]})
-srcQ = {"name": "srcQ", "df": pd.DataFrame({"钥匙事业部": _BB, "值": ["A1", "A2", "A3"]})}
+_rQ0 = fill_multi(pd.DataFrame({"钥匙事业部": _AA3, "值": ["", "", ""]}),
+                  key_cols=["钥匙事业部"],
+                  sources=[{"name": "srcQ", "df": pd.DataFrame({"钥匙事业部": _BB3,
+                                                                "值": ["A1", "A2", "A3"]})}])
+check("canon 默认：1/2/3事业部 ↔ 一/二/三事业部 无需确认直接 100% 命中（一类自动解决）",
+      list(_rQ0["result"]["值"]) == ["A1", "A2", "A3"]
+      and all("ok:100" in str(x) for x in _rQ0["confidence"]["值"]))
+
+tplQ = pd.DataFrame({"钥匙分类": _AA, "值": [""]})
+srcQ = {"name": "srcQ", "df": pd.DataFrame({"钥匙分类": _BB, "值": ["A1"]})}
 stQ = store()
-kpQ = [_auto_key_pairs(["钥匙事业部"], srcQ, 70.0, None, tplQ, True)]
+kpQ = [_auto_key_pairs(["钥匙分类"], srcQ, 70.0, None, tplQ, True)]
 qs = build_value_questions(tplQ, [srcQ], kpQ, stQ)
-check("问题清单：只出一题、类型=整列、示例对正确（不是 3↔二 那种乱问）",
+check("问题清单：出一题、类型=整列、示例对正确（canon 解决不了的才问）",
       len(qs) == 1 and qs[0]["类型"] == "整列"
-      and qs[0]["示例模板值"] == "2事业部" and qs[0]["示例源表值"] == "二事业部"
-      and qs[0]["覆盖率"] == 100.0 and qs[0]["同类数"] == 3)
-_ap = apply_value_answers(tplQ, [srcQ], {("钥匙事业部", "srcQ"): {"ans": "same", "rule": qs[0]["规律"]}},
+      and qs[0]["示例模板值"] == "消防维保" and qs[0]["示例源表值"] == "消防维保类采购合同"
+      and qs[0]["覆盖率"] >= 100.0 - 1e-9 and qs[0]["同类数"] == 1)
+_ap = apply_value_answers(tplQ, [srcQ], {("钥匙分类", "srcQ"): {"ans": "same", "rule": qs[0]["规律"]}},
                           stQ)
 check("应用：整列类推（一条回答解决一类）", _ap and _ap[0][0] == "类推整列")
-_rQ = fill_multi(tplQ, key_cols=["钥匙事业部"], sources=[srcQ], conventions=stQ)
-check("类推后：三行全部 100% 精确命中（不再有非100%）",
-      list(_rQ["result"]["值"]) == ["A1", "A2", "A3"]
+_rQ = fill_multi(tplQ, key_cols=["钥匙分类"], sources=[srcQ], conventions=stQ)
+check("类推后：100% 精确命中（不再有非100%）",
+      list(_rQ["result"]["值"]) == ["A1"]
       and all("ok:100" in str(x) for x in _rQ["confidence"]["值"]))
 check("类推后：同一列不再出问题（同类不再问）",
       build_value_questions(tplQ, [srcQ], kpQ, stQ) == [])

@@ -209,6 +209,69 @@ check("列供给标签：附工作表名（多 sheet 文件可分辨）",
 _miss = supply_option_label({"source": 99, "col": "X", "how": "同名", "score": 100}, _src_sheet)
 check("列供给标签：越界 source 不崩（回退 ?）", _miss.startswith("?"))
 
+# ================= 新增：确定性机制（结构型 / canon 默认 / 修饰词碰撞 / 区分位 / 双源印证） =================
+from core.table_filler import (_diff_discriminating, _disc_series, _key_sim,
+                               _strippable_tokens, value_kind)
+
+check("结构型判定：日期/年月/金额/编号/文本 分类正确",
+      value_kind("2026-01-01") == "date" and value_kind("2026-11") == "date"
+      and value_kind("2026年1月1日") == "date" and value_kind("1,000") == "num"
+      and value_kind("YC-XMYC0122-WF02-26-0001") == "code"
+      and value_kind("怡安花园") == "text" and value_kind("3号楼") == "text")
+check("结构型：日期格式归一（2026/1/1 = 2026-01-01 = 2026年1月1日 = 时间戳）",
+      _key_sim("2026/1/1", "2026-01-01") == 100
+      and _key_sim("2026年1月1日", "2026-01-01") == 100
+      and _key_sim("2026-01-01 00:00:00", "2026-01-01") == 100)
+check("结构型：金额去千分位/小数归一（1,000 = 1000；26.10 = 26.1）",
+      _key_sim("1,000", "1000") == 100 and _key_sim("26.10", "26.1") == 100)
+check("结构型：编号差 1 个字符 → 0（模糊分不适用，绝不猜行）",
+      _key_sim("YC-XMYC10033-WF01-26-0001", "YC-XMYC1003-WF01-26-0001") == 0
+      and _key_sim("2026-11", "2026-12") == 0)
+check("canon 默认：1事业部 = 一事业部 = 第一事业部（100，不等口径本学习）",
+      _key_sim("1事业部", "一事业部") == 100 and _key_sim("第一事业部", "一事业部") == 100)
+check("canon 保区分度：第一 ≠ 第二、叠溪三期 ≠ 四期（不满分）",
+      _key_sim("第一事业部", "第二事业部") < 100
+      and _key_sim("叠溪花园三期", "叠溪花园四期") < 100)
+check("区分位差异识别：三/四 算区分位；楼/搂（含非区分位字）不算",
+      _diff_discriminating("叠溪花园3", "叠溪花园4")
+      and not _diff_discriminating("3号楼巡查", "3号搂巡查"))
+check("碰撞裁决（各表内部判）：同表两种形态并存 → 不许剥；跨表两种写法 → 允许剥",
+      "委外" not in _strippable_tokens({"绿化养护"}, {"绿化养护", "绿化养护委外"})
+      and "项目" in _strippable_tokens({"华夏中央广场"}, {"华夏中央广场项目"}))
+
+# 填充级：修饰差异 → 直接精确命中（100 无色）；区分位+有兄弟 → 留空不猜
+_tpl5 = pd.DataFrame({"项目名称": ["华夏中央广场"], "事业部": [""]})
+_s5a = pd.DataFrame({"项目名称": ["华夏中央广场项目"], "事业部": ["华二第三事业部"]})
+_r5 = fill_multi(_tpl5, key_cols=["项目名称"], sources=[{"name": "源", "df": _s5a}])
+check("修饰差异等价：华夏中央广场 ← 华夏中央广场项目 直接精确命中（100 无色）",
+      str(_r5["result"].at[0, "事业部"]).strip() == "华二第三事业部"
+      and str(_r5["confidence"].at[0, "事业部"]).startswith("ok"))
+
+_tpl6 = pd.DataFrame({"项目名称": ["叠溪花园三期"], "事业部": [""]})
+_s6a = pd.DataFrame({"项目名称": ["叠溪花园四期", "叠溪花园五期"], "事业部": ["甲部", "乙部"]})
+_r6a = fill_multi(_tpl6, key_cols=["项目名称"], sources=[{"name": "源", "df": _s6a}])
+check("区分位+值域确有兄弟（四期/五期并存）：三期模板 → 留空不猜行",
+      not str(_r6a["result"].at[0, "事业部"]).strip())
+_s6b = pd.DataFrame({"项目名称": ["叠溪花园四期"], "事业部": ["甲部"]})
+_r6b = fill_multi(_tpl6, key_cols=["项目名称"], sources=[{"name": "源", "df": _s6b}])
+check("区分位但无兄弟值（只有四期一个值）：照常模糊填（黄色，人工再确认）",
+      str(_r6b["result"].at[0, "事业部"]).strip() == "甲部"
+      and str(_r6b["confidence"].at[0, "事业部"]).startswith("high"))
+
+_tpl7 = pd.DataFrame({"项目名称": ["保利花园", "绿城小区"], "服务费": ["", ""]})
+_s7a = pd.DataFrame({"项目名称": ["保利花园城", "绿城小区"], "服务费": ["1000", "2000"]})
+_s7b = pd.DataFrame({"项目名称": ["保利花园", "绿城小区"], "服务费": ["1000", "9999"]})
+_r7b = fill_multi(_tpl7, key_cols=["项目名称"],
+                  sources=[{"name": "甲表", "df": _s7a}, {"name": "乙表", "df": _s7b}])
+check("双源印证：两源独立命中一致 → 高置信格自动升为 100（无色）",
+      str(_r7b["confidence"].at[0, "服务费"]).startswith("ok")
+      and "双源印证" in str(_r7b["confidence"].at[0, "服务费"])
+      and _r7b["stats"]["双源印证格数"] >= 1)
+check("两源矛盾照常：不一致 → 进矛盾清单、不升级、保持原填值",
+      "双源印证" not in str(_r7b["confidence"].at[1, "服务费"])
+      and _r7b["stats"]["两源矛盾格"] >= 1)
+
+
 # ================= 新增：自动配钥匙（值域/同义/择优/延后/两源交叉） =================
 from core.table_filler import pair_col, plan_keys, value_domain_sim
 

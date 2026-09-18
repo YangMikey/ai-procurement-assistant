@@ -14,6 +14,7 @@
 - 结果表下方只写「颜色图例 + 统计（+ 列名近似提示）」，不列来源表
 - 默认只产出新文件，不动原表
 """
+import difflib
 import re
 
 import pandas as pd
@@ -261,14 +262,219 @@ def pair_col(tpl_col, src_col, tpl_series=None, src_series=None,
     return sc, how
 
 
-def _key_sim(a, b):
-    """钥匙相似度（专用）：完全相同=100；否则允许"部分/字符袋"助分但**不满分**。
+# ---------- 结构型值（编号/日期/金额/纯数字）：格式归一后只认精确，模糊分不适用 ----------
+_FW_TRANS = str.maketrans(
+    "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
+    "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ（）／－．，：＃％＋",
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz()/-.,:#%+")
+_DATE_RE = re.compile(r"^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?(?:[ T].*)?$")
+_HEAD_DATE_RE = re.compile(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})")   # 时间戳被去空格后的兜底
+_YM_RE = re.compile(r"^(\d{4})[-/.年](\d{1,2})月?$")
+_Y8_RE = re.compile(r"^(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$")
+_NUM_RE = re.compile(r"^[-+]?[\d,，\s]*(?:\.\d+)?\s*%?$")
+_CODE_RE = re.compile(r"^(?=[A-Za-z0-9\-_/#.·+]*\d)(?=[A-Za-z0-9\-_/#.·+]*[A-Za-z])"
+                      r"[A-Za-z0-9\-_/#.·+]{4,}$")
 
-    避免 `A公司集团` vs `A公司` 因"包含"被判成 100% 而静默填充（应落到高置信=黄色，供复核）。
+
+def value_kind(v):
+    """值类型：date（日期/年月，含 2026-01-01、2026/1/1、2026年1月1日、2026-11、时间戳）
+    / num（金额、纯数字、百分比）/ code（字母+数字编号，如 YC-…-0001、GYS055410）/ text。"""
+    s = _fw2hw(str(v)).strip()
+    if _DATE_RE.match(s) or _HEAD_DATE_RE.match(s) or _Y8_RE.match(s):
+        return "date"
+    if _YM_RE.match(s):
+        return "date"
+    if _NUM_RE.match(s):
+        return "num"
+    if _CODE_RE.match(s):
+        return "code"
+    return "text"
+
+
+def _fw2hw(s):
+    return str(s).translate(_FW_TRANS)
+
+
+def _struct_norm(v):
+    """结构型值的格式归一：日期→YYYY-MM-DD（丢时间部分）、金额去千分位并统一小数、
+    编号全大写去空格。归一后相等 = 同一个值（100 分）。"""
+    s = _fw2hw(str(v)).strip()
+    k = value_kind(s)
+    if k == "date":
+        m0 = _HEAD_DATE_RE.match(s)          # 覆盖时间戳被去空格的情况（2026-01-0100:00:00）
+        if m0:
+            return "%s-%02d-%02d" % (m0.group(1), int(m0.group(2)), int(m0.group(3)))
+        m = _DATE_RE.match(s)
+        if m:
+            return "%s-%02d-%02d" % (m.group(1), int(m.group(2)), int(m.group(3)))
+        m2 = _YM_RE.match(s)
+        if m2:
+            return "%s-%02d" % (m2.group(1), int(m2.group(2)))
+        if _Y8_RE.match(s):
+            return "%s-%s-%s" % (s[:4], s[4:6], s[6:8])
+        return s
+    if k == "num":
+        s = s.replace(",", "").replace("，", "").replace(" ", "")
+        try:
+            f = float(s.rstrip("%"))
+            s = ("%d" % int(f)) if f == int(f) else ("%g" % f)
+            return s + ("%" if str(v).strip().endswith("%") else "")
+        except ValueError:
+            return s
+    if k == "code":
+        return s.upper().replace(" ", "")
+    return s
+
+
+# ---------- 区分位差异：差异全落在数字/序数/方位/单位词上 → 不许靠"像"猜行 ----------
+_DISC_CHARS = set(
+    "0123456789０１２３４５６７８９"
+    "零一二两三四五六七八九十百千"
+    "期栋幢座楼层单元室号＃#地块组团标段批季甲乙丙丁"
+    "东南西北"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+
+def _diff_discriminating(a, b):
+    """两个归一值的所有差异是否**全部**落在「区分位」字符上。
+
+    例：叠溪花园3 vs 叠溪花园4 ✓；…0001 vs …0002 ✓；楼 vs 搂（含非区分位）→ False。
     """
-    na, nb = norm_text(a), norm_text(b)
+    if a == b or not a or not b:
+        return False
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        seg = a[i1:i2] + b[j1:j2]
+        for ch in seg:
+            if ch not in _DISC_CHARS:
+                return False
+    return True
+
+
+def _disc_series(vals):
+    """值域里互为"区分位兄弟"的值集合：差异全落在区分位（叠溪三期↔四期、…0001↔…0002）。
+
+    只有当兄弟值**真实存在**时，这类差异才被禁止用来"猜行"（避免过度收紧）。
+    """
+    out = set()
+    vals = [v for v in vals if v]
+    if len(vals) < 2:
+        return frozenset()
+    try:
+        from rapidfuzz import fuzz as _fz, process as _pr
+        for a in vals:
+            for _s, b, _i in _pr.extract(a, vals, scorer=_fz.ratio,
+                                         score_cutoff=70, limit=6):
+                if b != a and _diff_discriminating(a, b):
+                    out.add(a)
+                    out.add(b)
+                    break
+    except ImportError:
+        for i, a in enumerate(vals):
+            for b in vals[i + 1:]:
+                if _name_sim(a, b)[0] >= 70 and _diff_discriminating(a, b):
+                    out.add(a)
+                    out.add(b)
+    return frozenset(out)
+
+
+# ---------- 修饰词剥离（值域碰撞裁决：剥了会撞上另一个真值 → 不许剥） ----------
+_MODIFIER_TOKENS = ("项目", "工程", "服务", "物业服务", "管理服务", "服务项目", "采购项目",
+                    "委外", "外包", "采购", "合同", "协议", "标段", "包", "批次", "年度",
+                    "服务费", "（）")
+_STRIP_EDGES = "-—－_·.、,，()（）[]【】 "
+
+
+def _strip_once(s, tok):
+    """按单个修饰词剥一次（尾优先，再头）；tok=「（）」表示剥尾部括注。返回 None 表示没剥。"""
+    if tok == "（）":
+        for cl, op in (("）", "（"), (")", "(")):
+            if s.endswith(cl):
+                k = s.rfind(op)
+                if k > 0:
+                    return s[:k].strip(_STRIP_EDGES)
+        return None
+    if s.endswith(tok) and len(s) > len(tok):
+        return s[:-len(tok)].strip(_STRIP_EDGES)
+    if s.startswith(tok) and len(s) > len(tok):
+        return s[len(tok):].strip(_STRIP_EDGES)
+    return None
+
+
+def _strip_tokens(s, tokens):
+    """把已裁决"可剥"的修饰词从首尾剥掉（可叠层：绿化养护委外服务 → 绿化养护）。"""
+    s = s.strip(_STRIP_EDGES)
+    for _ in range(6):
+        hit = False
+        for t in tokens:
+            r = _strip_once(s, t)
+            if r is not None and r:
+                s = r
+                hit = True
+        if not hit:
+            break
+    return s
+
+
+def _strippable_tokens(tpl_dom, src_dom):
+    """值域碰撞裁决：返回**可剥**的修饰词集合。
+
+    碰撞规则（**各表内部**判）：同一张表里同时存在「X」和「X+修饰词」（如 绿化养护 和
+    绿化养护委外 都在同一列）→ 该修饰词是区分性的 → 不许剥；
+    跨表一边「X」一边「X+修饰词」恰恰是**同一实体的两种写法** → 允许剥（剥完精确命中）。
+    只收常见无歧义词，最终由真值裁决。
+    """
+    ok = []
+    for t in _MODIFIER_TOKENS + ("（）",):
+        conflict = _affix_collides(tpl_dom, t) or _affix_collides(src_dom, t)
+        if not conflict:
+            ok.append(t)
+    return tuple(ok)
+
+
+def _affix_collides(dom, tok):
+    """同一列值域里是否存在「X」与「X+tok」两种形态并存（并存 = tok 是区分性的）。"""
+    domset = {d for d in dom if d}
+    if len(domset) < 2:
+        return False
+    for v in domset:
+        r = _strip_once(v, tok)
+        if r is not None and r and r in domset:
+            return True
+    return False
+
+
+def _kind_of(v):
+    """值类型判定（**用原值判**，norm_text 会把 x/X→* 破坏编号形态）；
+    引擎归一后的结构值带 "date:/num:/code:" 前缀，这里先剥前缀再判。"""
+    s = _fw2hw(str(v)).strip()
+    for p in ("date:", "num:", "code:"):
+        if s.startswith(p):
+            return p[:-1], s[len(p):]
+    return value_kind(s), s
+
+
+def _key_sim(a, b):
+    """钥匙相似度（专用）：
+    - 结构型（编号/日期/金额/纯数字）：**格式归一后只认精确**（相等=100，否则=0，模糊分不适用）
+    - 文本型：canon 归一（中文数字↔阿拉伯+修饰词）相等 = 100（**默认启用**，1事业部=一事业部）
+    - 其余：模糊相似度（"部分/字符袋"可助分但**不满分**，避免 `A公司` vs `A公司集团` 静默满分）
+    """
+    ka, va = _kind_of(a)
+    kb, vb = _kind_of(b)
+    if ka != "text" or kb != "text":
+        if ka != kb:
+            return 0.0
+        return 100.0 if _struct_norm(va) == _struct_norm(vb) else 0.0
+    na, nb = norm_text(va), norm_text(vb)
     if not na or not nb:
         return 0.0
+    ca, cb = _canon(na), _canon(nb)
+    if ca == cb:
+        return 100.0
     if na == nb:
         return 100.0
     try:
@@ -558,31 +764,44 @@ def _near_values(src, pairs, row_vals, target_col, lo=40.0, topn=3):
 
 
 def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on_tie=False,
-                  norm_fn=None, norm_fn_src=None):
+                  norm_fn=None, norm_fn_src=None, sib=None):
     """按"钥匙层次 n→1"在源表里找最佳行；层内先精确（索引）后模糊。
 
     pairs: [(模板钥匙列, 源列, 列名匹配度)]（按模板钥匙列顺序）
     row_vals: {模板钥匙列: 归一化值}（本行可用且达标的钥匙）
-    norm_fn / norm_fn_src: 模板侧 / 源表侧 归一化（口径本的规律与值等价在这里生效）
+    norm_fn / norm_fn_src: 模板侧 / 源表侧 归一化——可为 {模板列: 函数}（按列，含口径本
+      规律与碰撞裁决过的修饰词剥离）或单个函数；None = norm_text。
+    sib: {源列: 区分位兄弟值集合}——模糊差异全落在区分位（数字/序数…）且该值确有兄弟 → 该行**不猜**。
     返回 (row, score, k_used, tie_n, all_exact, rows) 或 None。
     """
-    nf = norm_fn or norm_text
-    nfs = norm_fn_src or nf
+
+    def _nf_of(fnmap, tk, dflt):
+        if isinstance(fnmap, dict):
+            return fnmap.get(tk) or dflt
+        return fnmap or dflt
+
+    nf = norm_fn if not isinstance(norm_fn, dict) else None
+    nfs = norm_fn_src if not isinstance(norm_fn_src, dict) else None
+    nf = nf or norm_text
+    nfs = nfs or nf
     avail = [(tk, scol) for tk, scol, _ in pairs if row_vals.get(tk)]
     if not avail:
         return None
     df = src["df"]
     for k in range(len(avail), 0, -1):
         sub = avail[:k]
-        want = tuple(nf(row_vals[tk]) for tk, _ in sub)
+        nf_list = [_nf_of(norm_fn, tk, nf) for tk, _c in sub]
+        nfs_list = [_nf_of(norm_fn_src, tk, nfs) for tk, _c in sub]
+        want = tuple(nf_list[x](row_vals[sub[x][0]]) for x in range(k))
         ck = (id(df), tuple(scol for _, scol in sub),
-              getattr(nf, "_tag", "raw"), getattr(nfs, "_tag", "raw"))
+              tuple(getattr(f, "_tag", "raw") for f in nf_list),
+              tuple(getattr(f, "_tag", "raw") for f in nfs_list))
         idx = idx_cache.get(ck)
         if idx is None:
             cols = [df[c].tolist() for _, c in sub]
             idx = {}
             for j in range(len(df)):
-                t = tuple(nfs(c[j]) for c in cols)
+                t = tuple(nfs_list[x](cols[x][j]) for x in range(k))
                 if all(t):
                     idx.setdefault(t, []).append(j)
             idx_cache[ck] = idx
@@ -591,9 +810,11 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on
             return _pick_row(rows, df, target_col, 100.0, k, True, blank_on_tie)
         best_score, best_rows = 0.0, []
         for j in range(len(df)):
-            vals = [nfs(df[c].iloc[j]) for _, c in sub]
+            vals = [nfs_list[x](df[sub[x][1]].iloc[j]) for x in range(k)]
             if not all(vals):
                 continue
+            if sib and _has_disc_conflict(vals, want, sub, sib):
+                continue               # 差异全落在区分位且有兄弟值 → 这行不可信，不猜
             sims = [_key_sim(vals[x], want[x]) for x in range(k)]
             if min(sims) < key_min:
                 continue
@@ -605,6 +826,18 @@ def _match_source(src, pairs, row_vals, key_min, target_col, idx_cache, blank_on
         if best_rows and best_score >= key_min:
             return _pick_row(best_rows, df, target_col, best_score, k, False, blank_on_tie)
     return None
+
+
+def _has_disc_conflict(vals, want, sub, sib):
+    """该候选行是否不可信：任一钥匙的模糊差异**全落在区分位**（数字/序数/方位…）
+    且该源值在值域里确有"区分位兄弟"（如 三期/四期 都真实存在）→ 不许靠"像"猜行。"""
+    for x in range(len(sub)):
+        sv = sib.get(sub[x][1])
+        if not sv or vals[x] == want[x]:
+            continue
+        if vals[x] in sv and _diff_discriminating(want[x], vals[x]):
+            return True
+    return False
 
 
 @skill(
@@ -741,16 +974,25 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
         except Exception:
             pass
 
-    def _src_norm(src_name, tpl_cols):
-        """该源表的钥匙归一化：canon（去修饰词+数字互转）+ 该源表已学到的值等价 + 类推规律。
+    def _src_norm(si):
+        """该源表各钥匙列的归一化（**默认启用，不再等口径本学过**）：
 
-        返回 (模板侧函数, 源表侧函数, 结论文本)；没有任何口径信息时返回 None（保持旧行为）。
+        canon（中文数字↔阿拉伯+首尾修饰词）→ 修饰词剥离（值域碰撞裁决：剥了会撞上
+        另一个真值的不剥，如 绿化养护 与 绿化养护委外 并存 → "委外"不许剥）
+        → 结构型格式归一 → 该源表已学到的值等价 / 类推规律 / 判定不同。
+        返回 (模板侧{列:fn}, 源表侧{列:fn}, 结论文本)。
         """
-        alias, rules, not_same = {}, [], []
-        if conventions is not None:
-            for tc in tpl_cols:
+        s = sources[si]
+        nm = s["name"]
+        fmap_t, fmap_s, _n_mod = {}, {}, 0
+        _n_alias = _n_rules = _n_ns = 0
+        for tk, scol, _cs in key_pairs[si]:
+            if tk not in template_df.columns or scol not in s["df"].columns:
+                continue
+            alias, rules, not_same = {}, [], []
+            if conventions is not None:
                 try:
-                    mp = conventions.value_mapping(tc, src_name) or {}
+                    mp = conventions.value_mapping(tk, nm) or {}
                 except Exception:
                     mp = {}
                 for k, v in mp.items():
@@ -758,45 +1000,96 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     if ck_ and cv:
                         alias[ck_] = cv
                 try:
-                    rules.extend(conventions.value_rules(tc, src_name) or [])
+                    rules.extend(conventions.value_rules(tk, nm) or [])
                 except Exception:
                     pass
                 for _k, it in ((conventions.data.get("not_same") or {}).items()):
-                    if it.get("scope") == f"{tc}|{src_name}":
+                    if it.get("scope") == f"{tk}|{nm}":
                         not_same.append((norm_text(it.get("a")), norm_text(it.get("b"))))
-        if not alias and not rules and not not_same:
-            return None
-        ns_pairs = set(not_same)
+            dom_t, dom_s = set(), set()
+            for v in template_df[tk].tolist():
+                if _has_value(v):
+                    dom_t.add(_canon(norm_text(v)))
+            for v in s["df"][scol].tolist():
+                if _has_value(v):
+                    dom_s.add(_canon(norm_text(v)))
+            dom_t.discard("")
+            dom_s.discard("")
+            strippable = (_strippable_tokens(dom_t, dom_s)
+                          if 0 < len(dom_t) + len(dom_s) <= 6000 else ())
+            ns_pairs = set(not_same)
+            _n_alias += len(alias)
+            _n_rules += len(rules)
+            _n_ns += len(not_same)
 
-        def f_tpl(v):
-            s = _canon(v)
-            for r in rules:
-                s = _apply_rule_tpl(r.get("rule") or {}, v)
-            return alias.get(s, s)
+            def f_t(v, _a=alias, _r=rules, _s=strippable):
+                s0 = _canon(norm_text(v))
+                s0 = _strip_tokens(s0, _s)
+                k0 = value_kind(s0)
+                if k0 != "text":
+                    s0 = f"{k0}:{_struct_norm(s0)}"
+                for r in _r:
+                    s0 = _apply_rule_tpl(r.get("rule") or {}, v)
+                return _a.get(s0, s0)
 
-        def f_src(v):
-            s = _canon(v)
-            for r in rules:
-                s = _apply_rule_src(r.get("rule") or {}, v)
-            s = alias.get(s, s)
-            for a, b in ns_pairs:                 # 人工判过"不是一回事"的 → 不许配上
-                if b and s == b:
-                    return _NOT_SAME_SENTINEL
-            return s
+            def f_s(v, _a=alias, _r=rules, _s=strippable, _ns=ns_pairs):
+                s0 = _canon(norm_text(v))
+                s0 = _strip_tokens(s0, _s)
+                k0 = value_kind(s0)
+                if k0 != "text":
+                    s0 = f"{k0}:{_struct_norm(s0)}"
+                for r in _r:
+                    s0 = _apply_rule_src(r.get("rule") or {}, v)
+                s0 = _a.get(s0, s0)
+                for a_, b_ in _ns:                # 人工判过"不是一回事"的 → 不许配上
+                    if b_ and s0 == b_:
+                        return _NOT_SAME_SENTINEL
+                return s0
 
-        f_tpl._tag = f"convT:{src_name}:{len(alias)}/{len(rules)}/{len(not_same)}"
-        f_src._tag = f"convS:{src_name}:{len(alias)}/{len(rules)}/{len(not_same)}"
-        return (f_tpl, f_src, f"{src_name}：值等价{len(alias)}条、类推规律{len(rules)}条、判定不同{len(not_same)}条")
+            f_t._tag = f"cT{si}.{tk}:{len(alias)}/{len(rules)}/{len(strippable)}"
+            f_s._tag = f"cS{si}.{tk}:{len(alias)}/{len(rules)}/{len(strippable)}"
+            fmap_t[tk] = f_t
+            fmap_s[tk] = f_s
+            if strippable:
+                _n_mod += 1
+        if _n_alias or _n_rules or _n_ns or _n_mod:
+            note = f"{nm}：值等价{_n_alias}条、类推规律{_n_rules}条、判定不同{_n_ns}条"
+            if _n_mod:
+                note += f"、可剥修饰词列 {_n_mod}（值域碰撞裁决）"
+        else:
+            note = None
+        return (fmap_t, fmap_s, note)
 
     nf_per_src, nf_notes = [], []
     for si, s in enumerate(sources):
-        tpl_cols = [tk for tk, _sc, _cs in key_pairs[si]]
-        got = _src_norm(s["name"], tpl_cols)
-        if got:
-            nf_per_src.append((got[0], got[1]))
+        got = _src_norm(si)
+        nf_per_src.append((got[0], got[1]))
+        if got[2]:
             nf_notes.append(got[2])
-        else:
-            nf_per_src.append((None, None))
+
+    # ---- 区分位"兄弟值"检测（每张源表的钥匙列各算一次）：
+    # 模糊差异全落在数字/序数/方位等区分位、且值域里确有兄弟值 → 禁止靠"像"猜行 ----
+    sib_per_src = []
+    for si, s in enumerate(sources):
+        sib_map = {}
+        fs_map = nf_per_src[si][1]
+        for tk, scol, _cs in key_pairs[si]:
+            if scol not in s["df"].columns:
+                continue
+            f_k = fs_map.get(tk) if isinstance(fs_map, dict) else fs_map
+            try:
+                vals = [(f_k or norm_text)(v) for v in s["df"][scol].tolist() if _has_value(v)]
+            except Exception:
+                vals = [norm_text(v) for v in s["df"][scol].tolist() if _has_value(v)]
+            vals = sorted({v for v in vals
+                           if v and v != _NOT_SAME_SENTINEL
+                           and not v.startswith(("date:", "num:", "code:"))})
+            if 1 < len(vals) <= 3000:
+                try:
+                    sib_map[scol] = _disc_series(vals)
+                except Exception:
+                    pass
+        sib_per_src.append(sib_map)
 
     # ---- 口径本②：候选列"85% 闸门"（首选列空缺时，才允许用别的候选列补）----
     # 判据：两候选列在都能取到值的行上，一致率 ≥85%（重叠 ≥10 行才判）；否则判"两套口径"，不许互补
@@ -837,7 +1130,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                             continue
                         m2 = _match_source(s2, pa, rv, key_min, ccol, idx_cache,
                                            norm_fn=nf_per_src[cd["source"]][0],
-                                           norm_fn_src=nf_per_src[cd["source"]][1])
+                                           norm_fn_src=nf_per_src[cd["source"]][1],
+                                           sib=sib_per_src[cd["source"]])
                         if m2 and m2[0] is not None:
                             v2 = s2["df"][ccol].iloc[m2[0]]
                             if _has_value(v2):
@@ -937,7 +1231,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                         continue
                     m = _match_source(s, pairs, row_vals, key_min, ccol, idx_cache,
                                       blank_on_tie=blank_on_tie,
-                                      norm_fn=nf_per_src[si][0], norm_fn_src=nf_per_src[si][1])
+                                      norm_fn=nf_per_src[si][0], norm_fn_src=nf_per_src[si][1],
+                                      sib=sib_per_src[si])
                     if not m:
                         continue
                     j, sc, k_used, tie_n, exact, hit_rows = m
@@ -958,12 +1253,12 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                         continue               # 编号类列不吃"不像编号"的列（如 甲方编号/项目编码）
                     if tie_n and not blank_on_tie:
                         sc = min(sc, 39.0)     # 旧行为：并列且取第 1 条 → 降档
-                    best = (v, sc, k_used, tie_n, cand["how"], pairs)
+                    best = (v, sc, k_used, tie_n, cand["how"], pairs, s["name"])
                     if _ci > 0:
                         n_complement += 1      # 记：这格是靠次选候选列补的
                     break
                 if best:
-                    v, sc, k_used, tie_n, how, pairs = best
+                    v, sc, k_used, tie_n, how, pairs, s_name = best
                     used_tks = [tk for tk, _c, _s in pairs][:k_used]
                     # 折减按**跳数**：只用原值钥匙 → 不折减；用了补出来的值 → 每跳 ×0.9
                     g = max((gen.get((i, tk), 0) for tk in used_tks), default=0)
@@ -973,7 +1268,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     filled[(i, tcol)] = (decayed, 0, k_used, tie_n)   # 轮次稍后回填
                     gen[(i, tcol)] = g + 1
                     n_fill[_band(decayed)] += 1
-                    round_fills.append((i, tcol, decayed, k_used, tie_n, ""))
+                    round_fills.append((i, tcol, decayed, k_used, tie_n, s_name))
                     progressed = True
                 elif tie_info is not None:
                     # 有几条候选但取值不同 → 宁可留空，交人工选（清单里写「多候选(已留空)」）
@@ -989,6 +1284,9 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     tag += f"·{k_used}钥匙"
                 if tie_n:
                     tag += f"·歧义{tie_n}行"
+                _g = gen.get((i, tcol), 0)
+                if _g > 1:
+                    tag += f"·{_g - 1}跳"          # 级联跳数：值离原始数据隔了几手
                 if src_tag:
                     tag += f"·{src_tag}"
                 conf.at[i, tcol] = tag
@@ -1064,7 +1362,9 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     # ---- 多源交叉核对（**独立复核**：两张源表都能供同一列时，比对两源给的值）----
     # 两源都有值且不同 = 矛盾。**按列自校准**：某列矛盾率 >50% → 判为"同名不同口径"，
     # 只给一行提示、不逐格列（否则 100+ 行会把人工清单淹掉）；≤50% 才逐格列。
+    # **含模糊/级联命中**：不再要求两源都精确命中——命中方式不同也能互相印证/揭发。
     cross = {"可比格": 0, "矛盾": [], "口径不同": []}
+    confirmed = set()          # 双源印证：两源独立命中且一致 → 该格升为完全匹配
     _multi_cols = [c for c in target_cols
                    if len({cd["source"] for cd in (supply.get(c) or [])}) >= 2]
     if _multi_cols:
@@ -1095,9 +1395,11 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                              if tk in final_avail[i] and tk != tcol]
                     if not pairs:
                         continue
-                    m = _match_source(s, pairs, final_avail[i], key_min, ccol, idx_cache)
-                    if not m or m[0] is None or not m[4]:
-                        continue          # 只在"钥匙精确命中"时才做两源比对（否则是拿苹果比橘子）
+                    m = _match_source(s, pairs, final_avail[i], key_min, ccol, idx_cache,
+                                      norm_fn=nf_per_src[si][0], norm_fn_src=nf_per_src[si][1],
+                                      sib=sib_per_src[si])
+                    if not m or m[0] is None:
+                        continue          # 模糊/级联命中也参与印证（不再要求精确命中）
                     v = s["df"][ccol].iloc[m[0]]
                     if _has_value(v):
                         got[si] = v
@@ -1110,6 +1412,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                                     "源A（值）": f"{sources[items[0][0]]['name']}：{items[0][1]}",
                                     "源B（值）": "；".join(f"{sources[si]['name']}：{v}"
                                                           for si, v in items[1:])})
+                    elif (i, tcol) in filled and _band(filled[(i, tcol)][0]) != "ok":
+                        confirmed.add((i, tcol))   # 两源独立命中且一致 → 该格已被验证
             cross["可比格"] += cmp_n
             if cmp_n >= 10 and len(bad) / cmp_n > 0.3:
                 # 大面积不一致 → 疑似"同名不同口径"，只提示、不逐格
@@ -1126,6 +1430,22 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
     n_cross_cmp = cross["可比格"]
     n_cross_bad = len(cross["矛盾"])
     cross_rate = (1.0 - n_cross_bad / n_cross_cmp) if n_cross_cmp else 1.0
+
+    # ---- 双源印证升级：两张源表**独立**命中同一格且值一致 → 已被验证，按完全匹配计 ----
+    # 这是"高置信 → 100%"的自动通道（另一条是人工确认写口径本）。
+    n_confirm = 0
+    for (i, tcol) in sorted(confirmed):
+        old = filled.get((i, tcol))
+        if not old:
+            continue
+        b0 = _band(old[0])
+        if b0 == "ok":
+            continue
+        n_fill[b0] = max(0, n_fill[b0] - 1)
+        n_fill["ok"] += 1
+        filled[(i, tcol)] = (100.0, old[1], old[2], old[3])
+        conf.at[i, tcol] = f"ok:100@{old[1]}·双源印证"
+        n_confirm += 1
 
     # ---- 需人工确认清单：只收「必看」（多候选留空 / 未补上）----
     review = []
@@ -1176,6 +1496,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
              "留空合计": n_fill["miss"],
              "延后源表数": len(deferred_sources),
              "经验库命中": n_exp,
+             "双源印证格数": n_confirm,
             "非100%格数": n_fill["high"] + n_fill["mid"] + n_fill["low"],
             "值等价学习(条)": n_equiv, "互补格数": n_complement,
             "拒绝互补列": list(gate_blocked), "口径说明": list(equiv_notes),
@@ -1229,9 +1550,15 @@ def build_value_questions(template_df, sources, key_pairs, conventions=None,
                     done = set()
             su = {norm_text(x) for x in svals}
             cnt = Counter(norm_text(x) for x in tvals)
+            # 引擎空间里的"已等价"集合：canon + 修饰词剥离（碰撞裁决）后相等的不再出题
+            _st = _strippable_tokens(
+                {_canon(x) for x in map(norm_text, tvals)},
+                {_canon(x) for x in map(norm_text, svals)})
+            skeys = {_strip_tokens(_canon(x), _st) for x in map(norm_text, svals)}
             cands = []
             for v, c in cnt.items():
-                if v in su or v in done:
+                vkey = _strip_tokens(_canon(v), _st)
+                if vkey in skeys or v in done:
                     continue
                 sc, sv = max(((_key_sim(v, x), x) for x in su), default=(0.0, ""))
                 if sc >= lo:
@@ -1523,15 +1850,18 @@ def legend_lines(stats):
         f"中置信 {stats['中置信(40-80%)']}，低置信 {stats['低置信(20-40%)']}，"
         f"未匹配 {stats['未匹配(留空)']}",
         f"有未补全格的行数：{stats['未补全行数']}",
+        "浅色格的说明：鼠标悬停可看该格的置信、轮次/级联跳数与来源（Excel 批注）",
     ]
     extra = []
     if stats.get("间接补全格数"):
         extra.append(f"含 {stats['间接补全格数']} 格为多轮间接补全（置信已按跳数折减）")
+    if stats.get("双源印证格数"):
+        extra.append(f"双源印证 {stats['双源印证格数']} 格：两张源表**独立**命中且一致 → 已按完全匹配(100%)计")
     if stats.get("歧义格数"):
         extra.append(f"有 {stats['歧义格数']} 格命中多行且取值不同 → **已留空**（见「需人工确认」清单，选一条填）")
     if stats.get("延后源表数"):
         extra.append(f"有 {stats['延后源表数']} 张源表第 1 轮延后（只有 1 把钥匙，等后续轮次凑第二把）")
-        extra.append(f"两源交叉核对：{stats['两源可核对格']} 格有两张源表都能供（都精确命中才比），"
+        extra.append(f"两源交叉核对：{stats['两源可核对格']} 格有两张源表都能供（含模糊/级联命中），"
                      f"其中矛盾 {stats.get('两源矛盾格', 0)} 格（一致率 {stats.get('两源一致率', 100)}%）"
                      + ("，见「两源矛盾」Sheet / 页面抽查区" if stats.get("两源矛盾格") else ""))
     for _line in (stats.get("两源口径不同列") or []):
@@ -1541,10 +1871,48 @@ def legend_lines(stats):
     return lines + extra
 
 
+def _conf_comment(tag):
+    """把置信标签翻译成人话（Excel 批注用，验收时鼠标悬停即见）。
+
+    例："high:90@2·2钥匙·1跳·金蝶对账" → "高置信 90%｜第2轮补全｜2把钥匙｜级联1跳｜来源：金蝶对账"
+    """
+    t = str(tag)
+    if not t or t == "miss":
+        return "未匹配（留空）：源表里没有可靠的对应行"
+    try:
+        band, rest = t.split(":", 1)
+        score, rest2 = rest.split("@", 1)
+        parts = rest2.split("·")
+    except Exception:
+        return t
+    nm = {"ok": "完全匹配", "high": "高置信", "mid": "中置信", "low": "低置信"}.get(band, band)
+    bits = []
+    if parts[0] not in ("", "0"):
+        bits.append(f"第{parts[0]}轮补全")
+    for p in parts[1:]:
+        if p == "双源印证":
+            bits.append("双源印证（两张源表独立命中且一致）")
+        elif p == "经验库":
+            bits.append("你之前人工确认过")
+        elif p.endswith("钥匙"):
+            bits.append(f"{p[:-2]}把钥匙")
+        elif p.startswith("歧义"):
+            bits.append(f"源表有{p[2:]}行同样像")
+        elif p.endswith("跳"):
+            bits.append(f"级联{p}")
+        else:
+            bits.append(f"来源：{p}")
+    return f"{nm} {score}%" + ("：" + "；".join(bits) if bits else "")
+
+
 def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, review_df=None,
                   cross_df=None):
-    """写出带颜色的整合表 + 下方备注块（表头/列宽/冻结/筛选/数字格式由 theme 统一处理）。"""
+    """写出带颜色的整合表 + 下方备注块（表头/列宽/冻结/筛选/数字格式由 theme 统一处理）。
+
+    非 100% 的格会附 **Excel 批注**（悬停即见置信/轮次/来源），验收不用翻清单。
+    """
     from openpyxl import Workbook
+    from openpyxl.comments import Comment
     from openpyxl.styles import Alignment, Font, PatternFill
 
     from .theme import style_sheet as _style
@@ -1559,14 +1927,19 @@ def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, re
 
     for r in range(2, ws.max_row + 1):
         for c in range(1, len(cols) + 1):
-            band = str(conf_df.iloc[r - 2, c - 1]).split(":")[0] if (r - 2) < len(conf_df) else ""
+            tag = str(conf_df.iloc[r - 2, c - 1]) if (r - 2) < len(conf_df) else ""
+            band = tag.split(":")[0]
             spec = COLORS.get(band)
             if not spec or not spec["fill"]:
+                if "双源印证" in tag:
+                    ws.cell(row=r, column=c).comment = Comment(_conf_comment(tag), "AI采购助理")
                 continue
             cell = ws.cell(row=r, column=c)
             cell.fill = PatternFill("solid", fgColor="FF" + spec["fill"].lstrip("#"))
             if spec["font"]:
                 cell.font = Font(color="FF" + spec["font"].lstrip("#"))
+            if band in ("high", "mid", "low"):
+                cell.comment = Comment(_conf_comment(tag), "AI采购助理")
 
     notes = list(legend_lines(stats)) if stats is not None else []
     if extra_notes:
