@@ -37,11 +37,11 @@ from core.highlighter import PRESETS, export_highlighted
 from core.llm_client import (CACHE_PATH as LLM_CACHE_PATH, DEFAULT_MODEL,
                              LLMClient, PROVIDER_PRESETS, load_config, save_config)
 from core.matcher import run_match
-from core.parser_rule import manual_quote, parse_quote_file
+from core.parser_rule import manual_quote
 from core.parser_llm import parse_quote_auto
 from core.templater import fill_template
 from core.registry import list_skills
-from core.table_filler import COLORS as FILL_COLORS, export_filled, fill_multi
+from core.table_filler import export_filled, fill_multi
 from core.theme import beautify_bytes, beautify_file_in_place
 from ui_components import (browse_file_path, browse_file_paths, file_key, pick_columns,
                            pick_header_row, save_to_folder)
@@ -68,7 +68,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.13"
+BUILD = "2026-09-15.14"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）

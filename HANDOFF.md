@@ -1,3 +1,32 @@
+# 项目瘦身（2026-09-17，第 0 档 + 第 1 档）
+
+**结论**：项目 ~9,900 行不算离谱，问题在"改动成本"——`table_filler.py` 曾 2,032 行/51 函数
+承担 5 类职责 + 每次验证 17 套 ×2。本回合只做**不动机制语义**的降本。
+
+## 第 0 档：测试分档（`tests/run.py` 新增）
+- `py tests\run.py 快` = 冒烟 + 多表补全 + 真实三文件（**实测 25 秒**，日常迭代用）
+- `py tests\run.py 全` = 17 套一遍（**实测 39 秒**，收尾用；收尾纪律的关键套再复跑不变）
+- synth_quotes（造数脚本）不属于测试，永远不跑；失败时打印该套件输出尾部 + stderr
+- 此前"20~40 分钟"的估算其实偏大：套件本身很快，慢的是 real3/UID（大文件加载）
+
+## 第 1 档：低风险清理
+- **删死代码**：`exp_key_values`（死函数）、`and False` 恒假分支、占位 `dom = 0.0`+空 try、
+  未用 `pref_col`、未用导入（table_filler 的 `Alignment`；app.py 的 `FILL_COLORS`/`parse_quote_file`）
+- **常量集中**：KEY_MIN / COL_DEFAULT_THRESHOLD / PROMOTE_MIN / TIE_STOP_MIN / MAX_ROUNDS /
+  GATE_RATE / GATE_MIN_OVERLAP / EXP_NS / _NOT_SAME_SENTINEL 全部集中到文件头一处
+- **合重复**：`discover_supply` 与 `all_supply_options` 的"扫列+打分"抽成 `_scan_source_cols()`
+  公共底座（两者各自保留差异：阈值/守卫过滤 vs 全列列出）
+- `table_filler.py` 2,032 → 约 2,000 行（净删 ~100 行量级，行为零变化）
+
+## 验证
+- 快档 25 秒 / 全档 39 秒，**17 套一次全过**（×2 由收尾纪律另行复跑）
+- 顺手修了重构笔误（`tpl_col`→`tcol`，由全量档当场暴露并修复）
+
+## 后续（未做，等观察）
+- 第 2 档（拆 table_filler.py 成 4 模块 + 薄壳 re-export）：观察一周再定
+- 第 3 档（合并三套印证）：放到"放手前"
+- 第 4 档（_disc_series O(N²) 缓存）：文件更大时再做
+
 # 多表补全 · 同名互补豁免 + 互补格上色 + 默认选中修根因（2026-09-17）
 
 **用户口径**：

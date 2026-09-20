@@ -39,6 +39,13 @@ COLORS = {
 }
 KEY_MIN = 20.0          # 低于此分视为"未匹配"（留空+红）
 COL_DEFAULT_THRESHOLD = 70.0
+PROMOTE_MIN = 80.0        # 补出的值置信 ≥ 此分才允许"升级为钥匙"（级联用）
+TIE_STOP_MIN = 80.0       # 钥匙命中多行时：≥此分视为"真歧义"（留空、不回退）；<此分当没命中
+MAX_ROUNDS = 4            # 级联最大轮数（提前收敛：某轮无新增即停）
+GATE_RATE = 0.85          # 85% 互补闸门：次选候选列与首选列一致率 ≥85%（重叠≥10行）才允许互补
+GATE_MIN_OVERLAP = 10
+EXP_NS = "多表补全"        # 经验库命名空间（与两表匹配的键区分开）
+_NOT_SAME_SENTINEL = "\x00NOTSAME"   # 人工判过"不是一回事"的源值 → 归一到这里（与任何真实值都不相似）
 
 # ---------- 列名同义词族（先内置几组常见；后续可由经验库扩充） ----------
 # 注意：「到期/截止/截至」是**日期口径**，「终止/失效」是**状态口径** —— 绝不能算一族
@@ -488,13 +495,6 @@ def _key_sim(a, b):
     return max(r, p - 10.0, g - 5.0, 0.0)
 
 
-PROMOTE_MIN = 80.0        # 补出的值置信 ≥ 此分才允许"升级为钥匙"（级联用）
-TIE_STOP_MIN = 80.0       # 钥匙命中多行时：≥此分视为"真歧义"（留空、不回退）；<此分当没命中
-MAX_ROUNDS = 4            # 级联最大轮数（提前收敛：某轮无新增即停）
-EXP_NS = "多表补全"        # 经验库命名空间（与两表匹配的键区分开）
-_NOT_SAME_SENTINEL = "\x00NOTSAME"   # 人工判过"不是一回事"的源值 → 归一到这里（与任何真实值都不相似）
-
-
 def exp_key_of(vals):
     """经验库键：归一化后 \x1f 连接（与 ExperienceStore 存库口径一致）。"""
     try:
@@ -502,15 +502,6 @@ def exp_key_of(vals):
         return _exp_norm(vals)
     except Exception:
         return "\x1f".join("" if v is None else str(v) for v in vals)
-
-
-def exp_key_values(template_df, i, key_cols):
-    """界面写库用：与引擎 exp_key 完全同口径（键 = 命名空间 + 目标列 + 各行钥匙值）。
-
-    返回 dict 供 app 直接构造键；key_cols 由结果里的 `exp_key_cols` 给出。
-    """
-    return {str(c): ("" if not _has_value(template_df.at[i, c]) else str(template_df.at[i, c]))
-            for c in key_cols}
 
 
 def exp_key_for(template_df, i, tcol, key_cols):
@@ -1094,7 +1085,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
 
     # ---- 口径本②：候选列"85% 闸门"（首选列空缺时，才允许用别的候选列补）----
     # 判据：两候选列在都能取到值的行上，一致率 ≥85%（重叠 ≥10 行才判）；否则判"两套口径"，不许互补
-    GATE_RATE, GATE_MIN_OVERLAP = 0.85, 10
+    #（同名 100 的候选列豁免闸门——互为备份；互补格会上色标"互补"）
     gates = {}            # (tcol, 候选列所属源) -> allow
     gate_blocked = []     # 被拒的（列, 原因）
     if len(sources) >= 2:
@@ -1110,7 +1101,6 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
             if len(cands) < 2:
                 continue
             pref = cands[0]
-            pref_col = {pref["source"]: pref["col"]}
             for alt in cands[1:]:
                 if alt["source"] == pref["source"] and alt["col"] == pref["col"]:
                     continue
@@ -1737,34 +1727,22 @@ def apply_value_answers(template_df, sources, answers, conventions):
 
 def all_supply_options(tpl_col, sources, col_threshold=COL_DEFAULT_THRESHOLD, mapping=None,
                        conventions=None):
-    """「列供给」下拉用：**列出所有源表的所有列**（不按阈值筛掉），附列名分数/值域提示。
+    """「列供给」下拉用：**列出所有源表的所有列**（不按阈值筛掉），附列名分数提示。
 
-    手动映射优先排第一；其余按（列名分 → 值域重合 → 有值数）排序。**0% 也列**，由人来判断。
-    返回 [{source, col, score, how, filled, domain}]。
+    手动映射优先排第一；其余按（列名分 → 有值数）排序。**0% 也列**，由人来判断。
+    返回 [{source, col, score, how, filled}]。
     """
     mapping = mapping or {}
     out = []
-    for si, s in enumerate(sources):
-        df = s["df"]
-        for col in df.columns:
-            if col == s.get("key_col") and len(df.columns) > 1 and False:
-                continue
-            manual = bool(mapping.get(tpl_col)) and tuple(mapping[tpl_col]) == (si, col)
-            score, how = col_match(tpl_col, col, col_threshold)
-            dom = 0.0
-            try:
-                if tpl_col in getattr(df, "columns", []) or True:
-                    pass
-            except Exception:
-                pass
-            auto = (conventions.col_pair(tpl_col, s["name"]) if conventions is not None else None)
-            if auto and auto.get("col") == col:
-                how = "已确认"
-            out.append({"source": si, "col": col,
-                        "score": 101.0 if manual else score,
-                        "how": "手动" if manual else how,
-                        "filled": int(df[col].notna().sum()),
-                        "domain": dom})
+    for si, s, col, score, how, nonblank in _scan_source_cols(tpl_col, sources, col_threshold):
+        manual = bool(mapping.get(tpl_col)) and tuple(mapping[tpl_col]) == (si, col)
+        auto = (conventions.col_pair(tpl_col, s["name"]) if conventions is not None else None)
+        if auto and auto.get("col") == col:
+            how = "已确认"
+        out.append({"source": si, "col": col,
+                    "score": 101.0 if manual else score,
+                    "how": "手动" if manual else how,
+                    "filled": nonblank})
     out.sort(key=lambda c: (-c["score"], -c["filled"]))
     return out
 
@@ -1863,6 +1841,20 @@ def supply_option_label(cand, sources):
     return f"{head} →【{cand.get('col', '')}】({cand.get('how', '')},{cand.get('score', 0):.0f})"
 
 
+def _scan_source_cols(tpl_col, sources, col_threshold):
+    """公共底座：枚举每张源表的**每一列** → [(源序, 源dict, 列名, 列名分, 匹配方式, 非空数)]。
+
+    不过滤、不排序；discover_supply（阈值+守卫过滤）与 all_supply_options（全列列出）共用。
+    """
+    out = []
+    for si, s in enumerate(sources):
+        df = s["df"]
+        for col in df.columns:
+            score, how = col_match(tpl_col, col, col_threshold)
+            out.append((si, s, col, score, how, int(df[col].notna().sum())))
+    return out
+
+
 def discover_supply(tpl_cols, sources, col_threshold=COL_DEFAULT_THRESHOLD, mapping=None):
     """发现每个模板列的候选源列；返回 {模板列: [ {source, col, score, how, filled}, ... ]}。"""
     mapping = mapping or {}
@@ -1873,21 +1865,18 @@ def discover_supply(tpl_cols, sources, col_threshold=COL_DEFAULT_THRESHOLD, mapp
             msrc, mcol = mapping[tcol]
             cands.append({"source": msrc, "col": mcol, "score": 101.0, "how": "手动",
                           "filled": 10 ** 9})
-        for si, s in enumerate(sources):
-            df = s["df"]
-            for col in df.columns:
-                if col == s.get("key_col"):
-                    continue
-                if tcol in mapping and mapping[tcol] and (si, col) == tuple(mapping[tcol]):
-                    continue
-                score, how = col_match(tcol, col, col_threshold)
-                if score >= col_threshold and how != "冲突":
-                    if _name_looks_date(tcol) and not _looks_date_col(df[col])[0]:
-                        continue                      # 类型守卫：日期类目标列不吃状态/文本列
-                    nonblank = int(df[col].notna().sum())
-                    cands.append({"source": si, "col": col, "score": score, "how": how,
-                                  "filled": nonblank})
-        # 匹配度优先 → 有值数多者优先 → 源表顺序
+        for si, s, col, score, how, nonblank in _scan_source_cols(tcol, sources, col_threshold):
+            if col == s.get("key_col"):
+                continue
+            if tcol in mapping and mapping[tcol] and (si, col) == tuple(mapping[tcol]):
+                continue
+            if score < col_threshold or how == "冲突":
+                continue
+            if _name_looks_date(tcol) and not _looks_date_col(s["df"][col])[0]:
+                continue                      # 类型守卫：日期类目标列不吃状态/文本列
+            cands.append({"source": si, "col": col, "score": score, "how": how,
+                          "filled": nonblank})
+        # 匹配度高 → 有值多 → 源表顺序
         cands.sort(key=lambda c: (-c["score"], -c["filled"]))
         out[tcol] = cands
     return out
@@ -1977,7 +1966,7 @@ def export_filled(result_df, conf_df, out_path, stats=None, extra_notes=None, re
     """
     from openpyxl import Workbook
     from openpyxl.comments import Comment
-    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.styles import Font, PatternFill
 
     from .theme import style_sheet as _style
 
