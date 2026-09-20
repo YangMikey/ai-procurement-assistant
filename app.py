@@ -68,7 +68,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.12"
+BUILD = "2026-09-15.13"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -1026,8 +1026,12 @@ elif mode == "多表补全":
             _labels = ["不补"] + [
                 f"{_lbl2(_c, _sources)}｜有值 {_c['filled']}" for _c in _opts_raw]
             _def = 1 if _opts_raw else 0
+            # key 绑定"当前首选项"（源表+列+有值数）：数据/文件一变 → key 变 →
+            # 默认重新落到第 1 项（=100%+有值最多）；同一次会话里手动改的仍被记住
+            _sig = ("%s|%s|%s" % (_opts_raw[0]["source"], _opts_raw[0]["col"], _opts_raw[0]["filled"])
+                    if _opts_raw else "-")
             _pickc2 = st.selectbox(f"「{_tcol}」←", _labels, index=_def,
-                                   key=file_key("mfmap", _tcol, _thr2))
+                                   key=file_key("mfmap", _tcol, _thr2, _sig))
             if _pickc2 != "不补":
                 _c2 = _opts_raw[_labels.index(_pickc2) - 1]
                 _mapping2[_tcol] = (_c2["source"], _c2["col"])

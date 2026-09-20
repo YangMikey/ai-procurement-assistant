@@ -110,8 +110,10 @@ else:
           )
     check("两源交叉核对：有可比格，且矛盾格数 ≤ 可比格（合同编号两源都供）",
           st["两源可核对格"] > 0 and 0 <= st["两源矛盾格"] <= st["两源可核对格"])
-    check("85% 闸门：两表同名不同口径（起始日期 59%/合同编号 11%）→ 拒绝互补、不硬补",
-          st["互补格数"] == 0 and len(st.get("拒绝互补列") or []) >= 1)
+    _comp_tags = [str(v) for v in r["confidence"].values.ravel() if "互补" in str(v)]
+    check("同名互补豁免：互补格（若有）全部封顶黄色档、与互补格数一致",
+          len(_comp_tags) == st["互补格数"]
+          and all(str(t).startswith(("high", "mid", "low")) for t in _comp_tags))
 
     # ---- 验收：用户的真实痛点（钥匙少一把 → 多候选）----
     # 金蝶有「合同二级分类」（表头 三级≠二级 被判冲突）但取值与模板「采购三级分类」高度重合

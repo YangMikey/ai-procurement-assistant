@@ -1114,6 +1114,9 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
             for alt in cands[1:]:
                 if alt["source"] == pref["source"] and alt["col"] == pref["col"]:
                     continue
+                if alt["how"] == "同名" and alt["score"] >= 100.0 - 1e-9:
+                    gates[(tcol, alt["source"])] = True    # 同名100 互为备份 → 豁免 85% 闸门（互补格上色标"互补"）
+                    continue
                 va, vb = [], []
                 for i in template_df.index:
                     rv = base_avail.get(i) or {}
@@ -1207,7 +1210,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                         gen[(i, tcol)] = 0
                         n_fill["ok"] += 1
                         n_exp += 1
-                        round_fills.append((i, tcol, 100.0, 1, 0, "经验库"))
+                        round_fills.append((i, tcol, 100.0, 1, 0, "经验库", False))
                         progressed = True
                         continue
                 best = None
@@ -1254,23 +1257,25 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                         continue               # 编号类列不吃"不像编号"的列（如 甲方编号/项目编码）
                     if tie_n and not blank_on_tie:
                         sc = min(sc, 39.0)     # 旧行为：并列且取第 1 条 → 降档
-                    best = (v, sc, k_used, tie_n, cand["how"], pairs, s["name"])
+                    best = (v, sc, k_used, tie_n, cand["how"], pairs, s["name"], _ci > 0)
                     if _ci > 0:
                         n_complement += 1      # 记：这格是靠次选候选列补的
                     break
                 if best:
-                    v, sc, k_used, tie_n, how, pairs, s_name = best
+                    v, sc, k_used, tie_n, how, pairs, s_name, is_comp = best
                     used_tks = [tk for tk, _c, _s in pairs][:k_used]
                     # 折减按**跳数**：只用原值钥匙 → 不折减；用了补出来的值 → 每跳 ×0.9
                     g = max((gen.get((i, tk), 0) for tk in used_tks), default=0)
                     decayed = sc * (0.9 ** g)
+                    if is_comp:
+                        decayed = min(decayed, 90.0)   # 互补格封顶高置信档（浅黄）+ 标"互补"，供抽查
                     result.at[i, tcol] = _norm_value(v)
                     tie_cells.pop((i, tcol), None)     # 之前判过"多候选"的格，这轮补上了 → 撤掉标记
                     filled[(i, tcol)] = (decayed, 0, k_used, tie_n)   # 轮次稍后回填
-                    hit_trust[(i, tcol)] = (sc, used_tks)   # 链式印证：匹配分 + 用了哪几把钥匙
+                    hit_trust[(i, tcol)] = (sc, used_tks, is_comp)   # 链式印证：匹配分 + 用了哪几把钥匙
                     gen[(i, tcol)] = g + 1
                     n_fill[_band(decayed)] += 1
-                    round_fills.append((i, tcol, decayed, k_used, tie_n, s_name))
+                    round_fills.append((i, tcol, decayed, k_used, tie_n, s_name, is_comp))
                     progressed = True
                 elif tie_info is not None:
                     # 有几条候选但取值不同 → 宁可留空，交人工选（清单里写「多候选(已留空)」）
@@ -1278,7 +1283,7 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
 
         if progressed:
             eff_rounds += 1
-            for i, tcol, decayed, k_used, tie_n, src_tag in round_fills:
+            for i, tcol, decayed, k_used, tie_n, src_tag, is_comp in round_fills:
                 _sc0, _r0, _k0, _t0 = filled[(i, tcol)]
                 filled[(i, tcol)] = (decayed, eff_rounds, k_used, tie_n)
                 tag = f"{_band(decayed)}:{decayed:.0f}@{eff_rounds}"
@@ -1291,6 +1296,8 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                     tag += f"·{_g - 1}跳"          # 级联跳数：值离原始数据隔了几手
                 if src_tag:
                     tag += f"·{src_tag}"
+                if is_comp:
+                    tag += "·互补"                 # 靠同名列互补补上（首选列该行没值）→ 抽查
                 conf.at[i, tcol] = tag
         elif r == 1 and deferred_sources:
             continue                      # 第 1 轮只是"延后"，不算收敛
@@ -1465,7 +1472,9 @@ def fill_multi(template_df, key_col=None, sources=None, mapping=None,
                 continue
             if (i, tcol) not in hit_trust:
                 continue
-            sc_m, used_tks = hit_trust[(i, tcol)]
+            sc_m, used_tks, is_comp = hit_trust[(i, tcol)]
+            if is_comp:
+                continue                      # 互补格保持黄色（口径隔了一道，人看；双源印证除外）
             if sc_m < 100.0 - 1e-9:
                 continue                      # 模糊命中 → 永不继承
             if (i, tcol) in _bad_cells:
@@ -1905,6 +1914,9 @@ def legend_lines(stats):
     if stats.get("链式印证格数"):
         extra.append(f"链式印证 {stats['链式印证格数']} 格：精确命中且所用钥匙格全部可信（沿接力链继承印证）"
                      "→ 已按完全匹配(100%)计")
+    if stats.get("互补格数"):
+        extra.append(f"互补 {stats['互补格数']} 格：首选列该行没值 → 用**同名的第 2 候选列**补"
+                     "（黄色·互补，供抽查；不同名的互补仍受 85% 闸门约束）")
     if stats.get("歧义格数"):
         extra.append(f"有 {stats['歧义格数']} 格命中多行且取值不同 → **已留空**（见「需人工确认」清单，选一条填）")
     if stats.get("延后源表数"):
@@ -1942,6 +1954,8 @@ def _conf_comment(tag):
             bits.append("双源印证（两张源表独立命中且一致）")
         elif p == "链式印证":
             bits.append("链式印证（精确命中且所用钥匙格全部可信）")
+        elif p == "互补":
+            bits.append("互补格（首选列该行没值，用同名的第 2 候选列补）")
         elif p == "经验库":
             bits.append("你之前人工确认过")
         elif p.endswith("钥匙"):

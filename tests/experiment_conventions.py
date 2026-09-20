@@ -83,8 +83,8 @@ _sB = {"name": "源B", "df": pd.DataFrame({"钥匙": _keys,
                                                  for i in range(1, 13)]})}
 _rG = fill_multi(_tG, key_cols=["钥匙"], sources=[_sA, _sB], key_min=95,
                  mapping={"值": (0, "值")})       # 手动指定源A为首选（分 101）
-check("闸门：一致率 50% <85%（重叠 12 行）→ 判两套口径、拒绝互补",
-      _rG["stats"]["互补格数"] == 0 and len(_rG["stats"]["拒绝互补列"]) >= 1)
+check("同名豁免：同名两源（一致率 50%）不进拒绝清单——同名互为备份（互补格会上色标'互补'）",
+      len(_rG["stats"]["拒绝互补列"]) == 0)
 # 一致率 100% 的两列 → 允许互补（首选列某行为空时，用另一列补上）
 _keys2 = [f"m{i}" for i in range(1, 13)]
 _tH = pd.DataFrame({"钥匙": _keys2, "值": [""] * 12})

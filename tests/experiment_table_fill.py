@@ -102,7 +102,7 @@ c_miss = ws.cell(row=5, column=i_end)        # ZZZ集团：未匹配 → 浅红�
 check("导出：完全匹配不填色", c_ok.fill.fgColor.rgb in (None, "00000000"))
 check("导出：未匹配单元格=主题「缺失」浅灰（FFF2F2F2）",
       str(c_miss.fill.fgColor.rgb).upper().endswith("F2F2F2"))
-tail_txt = "".join(str(ws.cell(row=rr, column=1).value or "") for rr in range(ws.max_row - 6, ws.max_row + 1))
+tail_txt = "".join(str(ws.cell(row=rr, column=1).value or "") for rr in range(ws.max_row - 14, ws.max_row + 1))
 check("导出：表格下方写了图例/统计备注", "颜色图例" in tail_txt and "统计" in tail_txt)
 wb.close()
 os.remove(TMP)
@@ -274,9 +274,11 @@ check("两源矛盾照常：不一致 → 进矛盾清单、不升级、保持�
 # ---- 链式印证：精确命中 + 所用钥匙格全部可信 → 继承印证升 100（复刻"单源列级联1跳"场景）----
 # S2 同名两行事业部不同 → 只用项目名称是歧义（留空）；第2轮靠补出的合同编号消歧 → 90%
 # 链头（合同编号，第1轮由 S1 精确填出）可信 → 继承印证升 100
-_tpl8 = pd.DataFrame({"项目名称": ["保利花园"], "采购三级分类": ["绿化养护"],
-                      "合同编号": [""], "事业部": [""]})
-_s8a = pd.DataFrame({"项目名称": ["保利花园"], "采购三级分类": ["绿化养护"], "合同编号": ["CT-A"]})
+# S1 供合同编号（2 值排前），S2 供事业部；S2 同名两行事业部不同 → 需补出的合同编号消歧 → 90% → 继承升 100
+_tpl8 = pd.DataFrame({"项目名称": ["保利花园", "玫瑰花园"], "采购三级分类": ["绿化养护", "绿化养护"],
+                      "合同编号": ["", ""], "事业部": ["", ""]})
+_s8a = pd.DataFrame({"项目名称": ["保利花园", "玫瑰花园"], "采购三级分类": ["绿化养护", "绿化养护"],
+                     "合同编号": ["CT-A", "CT-C"]})
 _s8b = pd.DataFrame({"项目名称": ["保利花园", "保利花园"],
                      "合同编号": ["CT-A", "CT-B"], "事业部": ["甲部", "乙部"]})
 _r8 = fill_multi(_tpl8, key_cols=["项目名称", "采购三级分类"],
@@ -286,7 +288,8 @@ check("链式印证：级联1跳(90%) + 链头(合同编号)可信 → 自动升
       and "链式印证" in str(_r8["confidence"].at[0, "事业部"])
       and _r8["stats"]["链式印证格数"] >= 1)
 
-_s8c = pd.DataFrame({"项目名称": ["保利花园城"], "采购三级分类": ["绿化养护"], "合同编号": ["CT-A"]})
+_s8c = pd.DataFrame({"项目名称": ["保利花园城", "玫瑰花园"], "采购三级分类": ["绿化养护", "绿化养护"],
+                     "合同编号": ["CT-A", "CT-C"]})
 _r8b = fill_multi(_tpl8, key_cols=["项目名称", "采购三级分类"],
                   sources=[{"name": "S1", "df": _s8c}, {"name": "S2", "df": _s8b}])
 check("链头模糊(90%)不可信 → 不继承，保持黄色（人看）",
@@ -299,6 +302,46 @@ _r9 = fill_multi(_tpl9, key_cols=["项目名称"], sources=[{"name": "S2", "df":
 check("模糊命中（匹配分<100）永不继承（保持黄色）",
       str(_r9["confidence"].at[0, "事业部"]).startswith("high")
       and "链式印证" not in str(_r9["confidence"].at[0, "事业部"]))
+
+# ---- 同名互补豁免：首选列该行没值 → 同名的第 2 候选列补上（豁免 85% 闸门），黄色·互补 ----
+from core.table_filler import all_supply_options
+
+_namesA = [f"P{i}" for i in range(1, 13)]
+_t10 = pd.DataFrame({"项目名称": _namesA, "起始日期": [""] * 12})
+_s10a = pd.DataFrame({"项目名称": _namesA,
+                      "起始日期": ["2026-01-01"] * 11 + [""]})     # P12 没值
+_s10b = pd.DataFrame({"项目名称": _namesA,
+                      "起始日期": [f"2026-06-{i:02d}" for i in range(1, 13)]})  # 与甲表全不同 → 一致率 0
+_r10 = fill_multi(_t10, key_cols=["项目名称"],
+                  sources=[{"name": "甲表", "df": _s10a}, {"name": "乙表", "df": _s10b}])
+check("同名互补豁免：首选列缺值的行 → 同名第2候选补上（黄色·互补）",
+      str(_r10["result"].at[11, "起始日期"]).startswith("2026-06-12")
+      and str(_r10["confidence"].at[11, "起始日期"]).startswith("high")
+      and "互补" in str(_r10["confidence"].at[11, "起始日期"])
+      and _r10["stats"]["互补格数"] >= 1)
+check("同名互补豁免：非缺值的行仍来自首选列（100 无色，不走互补）",
+      str(_r10["result"].at[10, "起始日期"]) == "2026-01-01"
+      and str(_r10["confidence"].at[10, "起始日期"]).startswith("ok"))
+
+# ---- 非同名次选仍受 85% 闸门：同义列(结束日期)一致率低 → 拒绝互补、留空 ----
+_t11 = pd.DataFrame({"项目名称": _namesA, "截止日期": [""] * 12})
+_s11a = pd.DataFrame({"项目名称": _namesA, "截止日期": ["2026-01-01"] * 11 + [""]})
+_s11b = pd.DataFrame({"项目名称": _namesA, "结束日期": [f"2026-07-{i:02d}" for i in range(1, 13)]})
+_r11 = fill_multi(_t11, key_cols=["项目名称"],
+                  sources=[{"name": "甲表", "df": _s11a}, {"name": "乙表", "df": _s11b}])
+check("非同名次选仍受 85% 闸门：同义列一致率 0% → 拒绝互补、留空",
+      not str(_r11["result"].at[11, "截止日期"]).strip()
+      and any("截止日期" in x for x in _r11["stats"]["拒绝互补列"]))
+
+# ---- 同名 100 候选排序：有值多的排第一（默认选中=它）----
+_s13a = pd.DataFrame({"项目名称": list("ABCDEFG"),
+                      "起始日期": ["2026-01-01"] * 5 + [None, None]})
+_s13b = pd.DataFrame({"项目名称": list("ABCDEFG"), "起始日期": ["2026-02-01"] * 7})
+_o13 = all_supply_options("起始日期", [{"name": "甲", "df": _s13a}, {"name": "乙", "df": _s13b}], 70)
+_s13 = [c for c in _o13 if c["how"] == "同名" and c["score"] >= 100]
+check("同名100候选排序：有值多的排第一（默认选中=它）",
+      len(_s13) == 2 and _s13[0]["source"] == 1
+      and _s13[0]["filled"] == 7 and _s13[1]["filled"] == 5)
 
 
 # ================= 新增：自动配钥匙（值域/同义/择优/延后/两源交叉） =================
