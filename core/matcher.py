@@ -366,13 +366,13 @@ def run_match(match_df, key_df, match_keys, key_keys, match_supp, key_supp,
                     matched[i] = (LVL_EXPERIENCE, [(js[0], 100.0)])
                     unmatched_reason.pop(i, None)
                     n_exp += 1
-            # (b) 重复预警（多候选）→ 库消歧：库中目标恰是候选之一
+            # (b) 重复预警（多候选）→ 库消歧：**直查钥匙表索引**（right_index），
+            #     不依赖候选列表——这样"每行候选上限(MAX_CAND)"只影响展示条数，不影响自动命中
             for i in list(dup_map.keys()):
                 tgt = lut.get(_composite([mk[c][i] for c in match_keys]))
                 if tgt is None or tgt == IGNORE:
                     continue
-                js = [j for j in dup_map[i]
-                      if _composite([kk[c][j] for c in key_keys]) == tgt]
+                js = right_index.get(tgt, [])
                 if len(js) == 1:
                     matched[i] = (LVL_EXPERIENCE, [(js[0], 100.0)])
                     n_exp += 1

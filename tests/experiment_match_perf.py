@@ -71,4 +71,31 @@ check("正常数据：精确命中不受影响（2/2）",
 check("正常数据：无候选省略（备注不写未列出）",
       not any("未列出" in str(x) for x in r2["result"]["备注"].tolist()))
 
+# ---- 场景C：经验库消歧不依赖候选上限（库目标排在第 11 名之外 / 干脆不在候选里）----
+from core.experience import ExperienceStore  # noqa: E402
+
+_expf = os.path.join(os.environ["TEMP"], "opencode", "exp_perf.json")
+os.makedirs(os.path.dirname(_expf), exist_ok=True)
+if os.path.exists(_expf):
+    os.remove(_expf)
+
+m3 = pd.DataFrame([{"钥匙": "K"}])
+# 14 条"很像"的候选（K-01..K-14，ratio=40 ≥ 阈值35 → 会进重复预警、被截到 10 条）
+# + 1 条库目标 K-9999（ratio=25 < 阈值 → 本来就不是候选）
+k3 = pd.DataFrame({"钥匙": [f"K-{i:02d}" for i in range(1, 15)] + ["K-9999"],
+                   "事业部": [f"第{i:02d}部" for i in range(1, 15)] + ["第十五部"]})
+r3_no = run_match(m3, k3, ["钥匙"], ["钥匙"], [], [], ["事业部"],
+                  mode="fuzzy", threshold=35.0, log=lambda x: None)
+check("前置：不加经验库 → 该行是重复预警且候选≤上限",
+      r3_no["row_status"][0]["status"] == "重复预警"
+      and len(r3_no["row_status"][0]["combos"]) <= MAX_CAND)
+
+_exp = ExperienceStore(_expf)
+_exp.record("K", "K-9999", src="manual")
+r3 = run_match(m3, k3, ["钥匙"], ["钥匙"], [], [], ["事业部"],
+               mode="fuzzy", threshold=35.0, experience=_exp, log=lambda x: None)
+check("经验库消歧：库目标不在候选列表里（更不在前10）→ 仍自动命中",
+      r3["row_status"][0]["status"] == "经验库"
+      and r3["result"]["事业部"].iloc[0] == "第十五部")
+
 print(f"\n===== 两表匹配·性能/候选上限 通过：{ok} 项断言 =====")
