@@ -18,7 +18,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUICK = ["smoke_pipeline.py", "experiment_table_fill.py", "experiment_table_fill_real3.py"]
 ALL = QUICK + ["experiment_align.py", "experiment_beautify.py", "experiment_compare.py",
                "experiment_conventions.py", "experiment_features_b.py", "experiment_gongju.py",
-               "experiment_match_accuracy.py", "experiment_parser.py", "experiment_parser_llm.py",
+               "experiment_match_accuracy.py", "experiment_match_perf.py", "experiment_parser.py",
+               "experiment_parser_llm.py",
                "experiment_pipei.py", "experiment_table_fill_exp.py",
                "experiment_table_fill_accuracy.py", "test_llm_client.py", "test_ui_smoke.py"]
 

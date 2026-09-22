@@ -68,7 +68,7 @@ if CORE_STALE:
              "请**关闭正在运行的黑窗口**，再双击「启动采购助理.bat」重启服务；"
              "重启前匹配/换算/写回已暂时停用。")
 
-BUILD = "2026-09-15.14"
+BUILD = "2026-09-15.15"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 LOG_MAX_BYTES = 1_000_000       # 超过 ~1MB 自动轮转：app.log → app.log.1（只留一份，占用封顶）
@@ -466,7 +466,13 @@ if mode == "两表匹配补缺":
                 s6.metric("重复预警", stats["重复预警"])
                 s7.metric("人工忽略", stats.get("人工忽略", 0))
                 s8.metric("未匹配", stats["未匹配"])
-                st.dataframe(res["result"], height=480, width="stretch")
+                _nres = len(res["result"])
+                if _nres > 20000:
+                    st.caption(f"结果 {_nres} 行（重复预警会按候选展开）——页面只预览前 2000 行，"
+                               "完整结果请用下方「下载/写回」")
+                    st.dataframe(res["result"].head(2000), height=480, width="stretch")
+                else:
+                    st.dataframe(res["result"], height=480, width="stretch")
 
                 # ---- 人工确认（经验库兜底）：重复预警挑一条 / 未匹配忽略 / 模糊项可选记住 ----
                 _rs = res["row_status"]

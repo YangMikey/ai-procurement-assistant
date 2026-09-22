@@ -31,6 +31,8 @@ LVL_DUP = "重复预警"
 LVL_UNMATCHED = "未匹配"
 LVL_IGNORED = "人工忽略"
 
+MAX_CAND = 10    # 每行最多保留多少候选（按相似度取前 N）——防"候选爆炸→结果表爆炸"
+
 CLEAN_OPTIONS = [
     ("strip", "忽略前后空格"),
     ("ignore_case", "忽略大小写"),
@@ -147,17 +149,19 @@ def _fuzzy_sim_matrix(a_vals_2d, b_vals_2d, threshold, log, col_names):
         log("提示：未安装 rapidfuzz，回退到标准库 difflib（大数据量时会较慢）")
 
     n, m = len(a_vals_2d[0]), len(b_vals_2d[0])
-    sim = np.full((n, m), 100.0, dtype=np.float64)
+    if n * m > 200_000_000:
+        log(f"提示：相似度矩阵较大（{n}×{m}），内存约 {n * m * 4 / 1e9:.1f}GB，请耐心等待")
+    sim = np.full((n, m), 100.0, dtype=np.float32)
     for i, (a_col, b_col) in enumerate(zip(a_vals_2d, b_vals_2d)):
         if use_rapidfuzz:
             s = process.cdist(a_col, b_col, scorer=fuzz.ratio,
-                              score_cutoff=threshold, workers=-1).astype(np.float64)
+                              score_cutoff=threshold, workers=-1, dtype=np.float32)
         else:
             from difflib import SequenceMatcher
             if n * m > 2_000_000:
                 raise ValueError("数据量较大且缺少 rapidfuzz，模糊匹配会很慢；"
                                  "请先 pip install rapidfuzz 后重试")
-            s = np.zeros((n, m), dtype=np.float64)
+            s = np.zeros((n, m), dtype=np.float32)
             for x, av in enumerate(a_col):
                 for y, bv in enumerate(b_col):
                     r = SequenceMatcher(None, av, bv).ratio() * 100.0
@@ -245,9 +249,16 @@ def run_match(match_df, key_df, match_keys, key_keys, match_supp, key_supp,
         return a, b, list(pairs_m.keys())
 
     def candidates_of(level_cols_m, level_cols_k, exact, rows_m, rows_k):
-        """返回 ({m: [k...]}) 及 (m,k)->rate。"""
+        """返回 ({m: [k...]}, {(m,k): rate}, {m: 省略候选数})。
+
+        **每行最多保留 MAX_CAND 条候选（按相似度取前 N）**——这是"数据一多就卡"的根治点：
+        低区分度钥匙（如长编号、通用项目名）会让每行命中成百上千条候选，
+        旧实现把它们全塞进结果表（实测 5000 行 → 315 万行结果、6 秒+），
+        现在只列前 N 条，其余记在备注里（"另有 N 条未列出"）。
+        """
         cand = {}
         rate_map = {}
+        omitted = {}
         if exact:
             idx = {}
             for j in rows_k:
@@ -256,17 +267,27 @@ def run_match(match_df, key_df, match_keys, key_keys, match_supp, key_supp,
                     idx.setdefault(k, []).append(j)
             for i in rows_m:
                 k = _composite([level_cols_m[c][i] for c in level_cols_m])
-                cand[i] = idx.get(k, []) if k is not None else []
+                js = idx.get(k, []) if k is not None else []
+                if len(js) > MAX_CAND:
+                    omitted[i] = len(js) - MAX_CAND
+                    js = js[:MAX_CAND]
+                cand[i] = js
         else:
             a, b, names = col_lists(level_cols_m, level_cols_k, rows_m, rows_k)
             sim = _fuzzy_sim_matrix(a, b, threshold, log, names)
-            pos = {j: y for y, j in enumerate(rows_k)}
             for x, i in enumerate(rows_m):
-                js = [rows_k[y] for y in np.nonzero(sim[x])[0]]
-                cand[i] = js
-                for j in js:
-                    rate_map[(i, j)] = float(sim[x, pos[j]])
-        return cand, rate_map
+                row = sim[x]
+                nz = np.nonzero(row)[0]
+                if nz.size > MAX_CAND:
+                    top = nz[np.argpartition(-row[nz], MAX_CAND - 1)[:MAX_CAND]]
+                    top = top[np.argsort(-row[top])]
+                    omitted[i] = int(nz.size - MAX_CAND)
+                else:
+                    top = nz
+                cand[i] = [rows_k[y] for y in top]
+                for y in top:
+                    rate_map[(i, rows_k[y])] = float(row[y])
+        return cand, rate_map, omitted
 
     # ---- 三轮瀑布 ----
     levels = [(LVL_EXACT, True)]
@@ -277,6 +298,7 @@ def run_match(match_df, key_df, match_keys, key_keys, match_supp, key_supp,
 
     final_level = levels[-1]
     dup_map = {}
+    dup_omitted = {}      # 重复预警行：被省略的候选数（备注里写明）
     unmatched_reason = {}
     for level_name, exact in levels:
         if not remaining:
@@ -287,7 +309,7 @@ def run_match(match_df, key_df, match_keys, key_keys, match_supp, key_supp,
             cols_m, cols_k = mk, kk
         log(f"第{levels.index((level_name, exact)) + 1}轮「{level_name}」："
             f"待配 {len(remaining)} 行 × 候选钥匙 {len(avail)} 行")
-        cand, rates = candidates_of(cols_m, cols_k, exact, remaining, avail)
+        cand, rates, omitted = candidates_of(cols_m, cols_k, exact, remaining, avail)
         still = []
         is_final = (level_name, exact) == final_level
         for i in remaining:
@@ -298,6 +320,8 @@ def run_match(match_df, key_df, match_keys, key_keys, match_supp, key_supp,
             elif len(cs) >= 2:
                 if is_final:
                     dup_map[i] = {j: (100.0 if exact else rates[(i, j)]) for j in cs}
+                    if omitted.get(i):
+                        dup_omitted[i] = omitted[i]
                 else:
                     still.append(i)  # 多候选 → 下一轮用更多列甄别
             else:
@@ -307,6 +331,9 @@ def run_match(match_df, key_df, match_keys, key_keys, match_supp, key_supp,
                     )
                 else:
                     still.append(i)
+        if omitted:
+            log(f"  候选过多：{len(omitted)} 行按相似度只保留前 {MAX_CAND} 条"
+                f"（共省略 {sum(omitted.values())} 条，写入备注）")
         remaining = still
 
     # ---- 经验库兜底（规则之后）：无候选的补答案；多候选的消歧 ----
@@ -479,10 +506,14 @@ def run_match(match_df, key_df, match_keys, key_keys, match_supp, key_supp,
                 rows.append(merged_rec(i, fv) + [fv[k] for k in fetch_idx_new]
                             + [lvl, round(rate, 1), "", _note(lvl, rate, i)])
         elif i in dup_map:
+            _dup_note = _note(LVL_DUP, 0)
+            if dup_omitted.get(i):
+                _dup_note += (f"；另有 {dup_omitted[i]} 条候选未列出"
+                              f"（按相似度只列前 {MAX_CAND} 条）")
             for j, rate in dup_map[i].items():
                 fv = key_records[j]
                 rows.append(merged_rec(i, fv) + [fv[k] for k in fetch_idx_new]
-                            + [LVL_DUP, round(rate, 1), "", _note(LVL_DUP, rate)])
+                            + [LVL_DUP, round(rate, 1), "", _dup_note])
         elif i in ignored:
             rows.append(list(match_records[i]) + [""] * len(fetch_cols)
                         + [LVL_IGNORED, 0.0, "经验库已标记：无匹配项", _note(LVL_IGNORED, 0)])

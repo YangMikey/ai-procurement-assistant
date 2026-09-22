@@ -77,6 +77,8 @@ def style_sheet(ws, header_row=1, *, autosize=True, freeze=True, autofilter=True
     hr = int(header_row)
     ncols = ws.max_column
     nrows = ws.max_row
+    _CENTER = Alignment(horizontal="center", vertical="center")   # 复用对象（逐格新建很贵）
+    _BAND = PatternFill("solid", fgColor="FFF7F9FC")
     # 表头
     for c in range(1, ncols + 1):
         cell = ws.cell(row=hr, column=c)
@@ -84,22 +86,28 @@ def style_sheet(ws, header_row=1, *, autosize=True, freeze=True, autofilter=True
         cell.fill = PatternFill("solid", fgColor=_argb(HEADER_FILL))
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     ws.row_dimensions[hr].height = 24
-    # 数据区：默认**居中**（表头也居中）；斑马纹
-    for r in range(hr + 1, nrows + 1):
-        for c in range(1, ncols + 1):
-            cell = ws.cell(row=r, column=c)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            if banded and (r - hr) % 2 == 0 and cell.fill.patternType is None:
-                cell.fill = PatternFill("solid", fgColor="FFF7F9FC")
+    # 数据区：**一次遍历**同时做 居中 + 斑马纹 + 收集列值（避免多次 ws.cell 查找）
+    headers = [ws.cell(row=hr, column=c).value for c in range(1, ncols + 1)]
+    _want_vals = bool(autosize or number_formats)
+    col_cells = [[] for _ in range(ncols)]
+    col_vals = [[] for _ in range(ncols)]
+    for r, row in enumerate(ws.iter_rows(min_row=hr + 1, max_row=nrows, max_col=ncols), start=hr + 1):
+        band = banded and (r - hr) % 2 == 0
+        for idx, cell in enumerate(row):
+            cell.alignment = _CENTER
+            if band and cell.fill.patternType is None:
+                cell.fill = _BAND
+            if _want_vals:
+                col_cells[idx].append(cell)
+                col_vals[idx].append(cell.value)
     # 数字格式
     if number_formats:
-        for c in range(1, ncols + 1):
-            fmt = guess_number_format(ws.cell(row=hr, column=c).value,
-                                      [ws.cell(row=r, column=c).value for r in range(hr + 1, nrows + 1)])
+        for idx in range(ncols):
+            fmt = guess_number_format(headers[idx], col_vals[idx])
             if fmt:
-                for r in range(hr + 1, nrows + 1):
-                    if ws.cell(row=r, column=c).value is not None:
-                        ws.cell(row=r, column=c).number_format = fmt
+                for cell in col_cells[idx]:
+                    if cell.value is not None:
+                        cell.number_format = fmt
     # 最低值高亮（可选）
     if highlight_min:
         fill, font = COLORS["conclusion"]
@@ -123,10 +131,9 @@ def style_sheet(ws, header_row=1, *, autosize=True, freeze=True, autofilter=True
             for c in range(1, ncols + 1):
                 ws.column_dimensions[get_column_letter(c)].width = 16
         else:
-            for c in range(1, ncols + 1):
-                vals = [ws.cell(row=r, column=c).value for r in range(hr, nrows + 1)]
-                ws.column_dimensions[get_column_letter(c)].width = estimate_width(
-                    vals[1:], vals[0], min_w, max_w)
+            for idx in range(ncols):
+                ws.column_dimensions[get_column_letter(idx + 1)].width = estimate_width(
+                    col_vals[idx], headers[idx], min_w, max_w)
     # 冻结 + 筛选
     if freeze:
         ws.freeze_panes = ws.cell(row=hr + 1, column=1).coordinate
